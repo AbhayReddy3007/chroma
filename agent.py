@@ -15,8 +15,6 @@ Imports from the refactored module structure:
 """
 
 import asyncio
-import random
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -40,15 +38,7 @@ from .gcs_lister import (
 from .indexer import (
     chroma_client,
     get_or_create_collection,
-    index_text,
-    upload_pdf_to_gemini,
-    extract_text_via_gemini,
-    extract_dates_from_pdf,
-    cleanup_uploaded_file,
-    sentinel_exists,
-    find_in_any_collection,
-    copy_from_collection,
-    download_single_patent_pdf,
+    run_indexing,
 )
 
 # ── Blocking analyser ─────────────────────────────────────────────────────────
@@ -181,9 +171,9 @@ async def process_all_drugs() -> dict:
 async def _process_single_drug(drug_name: str) -> dict:
     """
     Full pipeline for one drug:
-      1.  Index / copy / skip files
-          Dates are extracted and stored upfront in parallel with text extraction.
-          No backfill step — dates are ready immediately after indexing.
+      1.  Index / copy / skip files — up to 5 workers in parallel via
+          run_indexing(). Non-analysable patents are pre-filtered.
+          Dates extracted and stored upfront; no backfill needed.
       2.  Fetch clinical timeline (BigQuery + fallback Excel, merged)
       3.  Blocking analysis (Steps 1-5)
       4.  Phase assignment + downstream calculations
@@ -202,60 +192,20 @@ async def _process_single_drug(drug_name: str) -> dict:
         return {"drug": drug_name, "status": "no_pdfs", "excel_path": None}
 
     # ── Step 1: Index / copy / skip ──────────────────────────────────────────
-    # Only US and EP patents are indexed. Others are skipped entirely.
+    # Non-analysable patents (unknown jurisdiction) are filtered out before
+    # indexing. All remaining refs are passed to run_indexing, which handles
+    # sentinel checks, cross-collection dedup, and full indexing in parallel
+    # across up to INDEXING_WORKERS (default 5) concurrent workers.
     # Dates are stored upfront — no separate backfill pass needed.
-    for ref in pdf_refs:
-        filename = ref["filename"]
+    analysable_refs = [
+        ref for ref in pdf_refs
+        if not is_non_analysable_patent(ref["filename"])
+    ]
+    skipped_count = len(pdf_refs) - len(analysable_refs)
+    if skipped_count:
+        print(f"[SKIP] {skipped_count} non-analysable patent(s) excluded from indexing")
 
-        if is_non_analysable_patent(filename):
-            print(f"[SKIP] {filename} -- non-US/EP patent, not indexed")
-            continue
-
-        if sentinel_exists(collection, filename):
-            print(f"[SKIP] {filename} -- already indexed")
-            continue
-
-        # Cross-collection dedup — copy carries dates from chunk metadata
-        source_col = find_in_any_collection(filename)
-        if source_col:
-            print(f"[COPY] {filename} -- from '{source_col}' (dates included)")
-            copy_from_collection(filename, source_col, collection, drug_name)
-            continue
-
-        # Full index: download -> upload -> text + dates in parallel -> store
-        print(f"[INDEX] {filename} -- downloading...")
-        pf = download_single_patent_pdf(ref["blob_name"], filename, drug_name)
-        if not pf:
-            continue
-
-        try:
-            uploaded_file = await upload_pdf_to_gemini(pf["path"])
-            if not uploaded_file:
-                continue
-
-            # Text and dates extracted in parallel — dates stored immediately
-            text, dates = await asyncio.gather(
-                extract_text_via_gemini(uploaded_file, filename),
-                extract_dates_from_pdf(pf["path"], filename),
-            )
-
-            if text:
-                await index_text(drug_name, filename, text, collection, dates=dates)
-                print(
-                    f"[INDEX] {filename} -- stored | "
-                    f"Filed: {(dates or {}).get('filing_date') or 'unknown'} | "
-                    f"Granted: {(dates or {}).get('grant_date') or 'unknown'}"
-                )
-
-            await cleanup_uploaded_file(uploaded_file)
-            await asyncio.sleep(1 + random.uniform(0, 0.5))
-
-        except Exception as e:
-            print(f"[ERROR] Processing {filename}: {e}")
-
-        finally:
-            if pf.get("tmp_dir"):
-                shutil.rmtree(pf["tmp_dir"], ignore_errors=True)
+    await run_indexing(drug_name, analysable_refs, collection)
 
     # ── Step 2: Fetch clinical timeline BEFORE blocking analysis ─────────────
     print(f"[AGENT] Fetching clinical timeline for '{drug_name}'...")
