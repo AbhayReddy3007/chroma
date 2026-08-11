@@ -281,7 +281,9 @@ def download_single_patent_pdf(blob_name: str, filename: str, drug_name: str) ->
         bucket     = client.bucket(GCS_BUCKET_NAME)
         blob       = bucket.blob(blob_name)
         tmp_dir    = Path(tempfile.mkdtemp(prefix=f"patents_{drug_name}_"))
-        local_path = tmp_dir / filename
+        # filename may be a subfolder-relative path (e.g. "US/patent.pdf");
+        # use only the basename for the local file to avoid missing-dir errors.
+        local_path = tmp_dir / Path(filename).name
         blob.download_to_filename(str(local_path))
         print(f"[GCS] Downloaded {filename}")
         return {"filename": filename, "path": str(local_path), "tmp_dir": str(tmp_dir)}
