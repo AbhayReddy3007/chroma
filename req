@@ -1,3 +1,18 @@
-pip install google-cloud-storage google-cloud-bigquery google-generativeai \
-            google-adk chromadb pymupdf pandas openpyxl python-dotenv \
-            beautifulsoup4 requests
+Drug: Axitinib
+Patents: 0
+Traceback (most recent call last):
+  File "C:\Users\P90022569\Downloads\indexing\indexing\run_analysis.py", line 17, in <module>
+    asyncio.run(main())
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\Downloads\indexing\indexing\run_analysis.py", line 14, in main
+    print(f"Time: {r['processing_time_seconds']}s")
+                   ~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'processing_time_seconds'
