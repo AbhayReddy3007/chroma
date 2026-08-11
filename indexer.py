@@ -1011,19 +1011,33 @@ async def fix_dates_for_file(
 # Main public function
 # ─────────────────────────────────────────────
 
+# Maximum number of PDFs processed concurrently by run_indexing.
+# Each worker slot covers: GCS download + Gemini upload + text/date extraction
+# + ChromaDB write. Raise this if Gemini rate limits allow; lower it to
+# reduce peak memory pressure on very large patent sets.
+INDEXING_WORKERS = int(os.getenv("INDEXING_WORKERS", "5"))
+
+
 async def run_indexing(
     drug_name:  str,
     pdf_refs:   List[dict],
     collection,
     reindex:    bool = False,
+    on_indexed: Optional[callable] = None,
 ) -> List[dict]:
     """
     For each PDF ref:
-      1. Skip if already indexed AND has valid dates
-      2. If indexed but missing filing date → re-download, re-extract dates,
-         update in-place (no re-embedding)
-      3. Copy from another collection if found — dates transfer automatically
-      4. Download from GCS -> upload to Gemini -> extract text + dates in parallel -> index
+      1. Skip if already indexed AND has valid dates        (no worker slot used)
+      2. Copy from another collection if found              (no worker slot used)
+      3. If indexed but missing filing date → fix-dates     (worker slot used)
+      4. Download → upload → text + dates in parallel → index (worker slot used)
+
+    Steps 3 and 4 run concurrently across up to INDEXING_WORKERS (default 5)
+    workers via asyncio.Semaphore. Steps 1 and 2 are fast local/DB operations
+    and run without throttling.
+
+    A threading.Lock serialises all ChromaDB writes so concurrent workers
+    don't interleave collection.add() calls.
 
     Dates are stored upfront during indexing.
     No backfill step is needed or performed.
@@ -1033,95 +1047,207 @@ async def run_indexing(
         pdf_refs:   List of {"filename": str, "blob_name": str} from gcs_lister
         collection: ChromaDB collection object
         reindex:    If True, force re-indexing even if sentinel exists
+        on_indexed: Optional async callback(filename: str) invoked immediately
+                    after each patent is confirmed ready in ChromaDB — whether
+                    it was freshly indexed, copied, or already present.
+                    Use this to pipeline downstream work (e.g. Step 1 analysis)
+                    so it starts per-patent rather than waiting for the full batch.
 
     Returns:
         List of {"filename": str, "path": str | None, "tmp_dir": str | None}
+        in the same order as pdf_refs.
     """
     import shutil
+    import threading
 
-    downloaded_files: List[dict] = []
+    semaphore   = asyncio.Semaphore(INDEXING_WORKERS)
+    chroma_lock = threading.Lock()
 
-    print(f"\n[INDEXER] Checking index status for {len(pdf_refs)} file(s)...")
+    print(
+        f"\n[INDEXER] Checking index status for {len(pdf_refs)} file(s) "
+        f"({INDEXING_WORKERS} parallel workers)..."
+    )
 
-    for ref in pdf_refs:
+    # ── Thread-safe wrappers for ChromaDB writes ──────────────────────────────
+
+    def _locked_index_text_sync(drug_name, filename, text, collection, dates):
+        """Run index_text synchronously inside the chroma_lock."""
+        # index_text is async; we need a new event loop to run it from a thread.
+        # Instead we inline the sync ChromaDB calls here using the lock.
+        import hashlib as _hashlib
+        from . import indexer as _self  # avoid circular — use module-level helpers
+
+        file_hash   = _hashlib.md5(filename.encode()).hexdigest()
+        sentinel_id = f"{file_hash}_complete"
+
+        try:
+            if collection.get(ids=[sentinel_id])["ids"]:
+                print(f"[INDEXING] Already fully indexed: {filename}")
+                return True
+        except Exception:
+            pass
+
+        try:
+            stale = collection.get(where={"filename": filename}, include=["ids"])
+            if stale["ids"]:
+                print(f"[INDEXING] Incomplete index for {filename} — clearing and re-indexing")
+                with chroma_lock:
+                    collection.delete(where={"filename": filename})
+        except Exception:
+            pass
+
+        return None  # signal: caller should proceed with async index_text
+
+    async def _index_text_locked(drug_name, filename, text, collection, dates):
+        """Call index_text (which writes to ChromaDB) under chroma_lock."""
+        loop = asyncio.get_running_loop()
+        # Run the ChromaDB .add() calls inside a thread that holds the lock.
+        # index_text itself is async but only awaits generate_embeddings;
+        # the actual collection.add() calls are synchronous. We therefore
+        # await index_text normally — the lock is acquired just before the
+        # add calls via a wrapper that acquires it in the executor.
+        # Simpler and correct: run the whole index_text under the lock since
+        # generate_embeddings is the slow part and doesn't touch ChromaDB.
+        embeddings_done = asyncio.Event()
+
+        async def _run():
+            return await index_text(drug_name, filename, text, collection, dates=dates)
+
+        # Acquire lock in executor so we don't block the event loop while waiting
+        acquired = await loop.run_in_executor(None, chroma_lock.acquire)
+        try:
+            result = await _run()
+        finally:
+            chroma_lock.release()
+        return result
+
+    async def _fix_dates_locked(filename, file_path, collection):
+        """Call fix_dates_for_file (which writes to ChromaDB) under chroma_lock."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, chroma_lock.acquire)
+        try:
+            return await fix_dates_for_file(filename, file_path, collection)
+        finally:
+            chroma_lock.release()
+
+    def _copy_locked(filename, source_col, collection, drug_name):
+        """copy_from_collection under chroma_lock (it's synchronous)."""
+        with chroma_lock:
+            return copy_from_collection(filename, source_col, collection, drug_name)
+
+    # ── Per-file coroutine ────────────────────────────────────────────────────
+
+    async def _process_one(ref: dict) -> dict:
+        """
+        Classify and process a single PDF ref.
+        Returns {"filename": str, "path": str|None, "tmp_dir": str|None}.
+        """
         filename = ref["filename"]
 
-        # Already indexed — check if dates are present
+        # ── Fast path: already indexed + has dates ────────────────────────
         if not reindex and sentinel_exists(collection, filename):
-            # Check if filing date is missing
             existing_dates = get_dates_from_chromadb(collection, filename)
             filing = existing_dates.get("filing_date")
             if filing and filing not in ("", "null", "None"):
                 print(f"[SKIP] {filename} — already indexed (Filed: {filing})")
-                downloaded_files.append({"filename": filename, "path": None, "tmp_dir": None})
-                continue
+                if on_indexed:
+                    await on_indexed(filename)
+                return {"filename": filename, "path": None, "tmp_dir": None}
 
-            # Filing date is missing — re-extract dates with improved pipeline
+            # Indexed but missing filing date — fix under semaphore
             print(f"[FIX-DATES] {filename} — indexed but missing filing date, re-extracting...")
-            pf = download_single_patent_pdf(ref["blob_name"], filename, drug_name)
-            if pf:
-                try:
-                    fixed = await fix_dates_for_file(filename, pf["path"], collection)
-                    if fixed:
-                        print(f"[FIX-DATES] {filename} — dates updated successfully")
-                    else:
-                        print(f"[FIX-DATES] {filename} — could not extract dates (will retry on next run)")
-                except Exception as e:
-                    print(f"[FIX-DATES] {filename} — error: {e}")
-                finally:
-                    if pf.get("tmp_dir"):
-                        shutil.rmtree(pf["tmp_dir"], ignore_errors=True)
-            else:
-                print(f"[FIX-DATES] {filename} — could not download for date re-extraction")
+            async with semaphore:
+                loop = asyncio.get_running_loop()
+                pf = await loop.run_in_executor(
+                    None, download_single_patent_pdf, ref["blob_name"], filename, drug_name
+                )
+                if pf:
+                    try:
+                        fixed = await _fix_dates_locked(filename, pf["path"], collection)
+                        if fixed:
+                            print(f"[FIX-DATES] {filename} — dates updated successfully")
+                        else:
+                            print(f"[FIX-DATES] {filename} — could not extract dates (will retry on next run)")
+                    except Exception as e:
+                        print(f"[FIX-DATES] {filename} — error: {e}")
+                    finally:
+                        if pf.get("tmp_dir"):
+                            shutil.rmtree(pf["tmp_dir"], ignore_errors=True)
+                else:
+                    print(f"[FIX-DATES] {filename} — could not download for date re-extraction")
 
-            downloaded_files.append({"filename": filename, "path": None, "tmp_dir": None})
-            continue
+            if on_indexed:
+                await on_indexed(filename)
+            return {"filename": filename, "path": None, "tmp_dir": None}
 
-        # Copy from another collection (dates embedded in chunks — no backfill needed)
+        # ── Fast path: cross-collection copy ─────────────────────────────
         if not reindex:
             source_col = find_in_any_collection(filename)
             if source_col:
                 print(f"[COPY] {filename} — found in '{source_col}', copying (dates included)...")
-                copy_from_collection(filename, source_col, collection, drug_name)
-                downloaded_files.append({"filename": filename, "path": None, "tmp_dir": None})
-                continue
+                _copy_locked(filename, source_col, collection, drug_name)
+                if on_indexed:
+                    await on_indexed(filename)
+                return {"filename": filename, "path": None, "tmp_dir": None}
 
-        # Full index: download -> upload -> text + dates in parallel -> store
-        print(f"[INDEX] {filename} — downloading...")
-        pf = download_single_patent_pdf(ref["blob_name"], filename, drug_name)
-        if not pf:
-            print(f"[WARNING] Could not download {filename}")
-            continue
-
-        downloaded_files.append(pf)
-
-        try:
-            uploaded_file = await upload_pdf_to_gemini(pf["path"])
-            if not uploaded_file:
-                print(f"[WARNING] Upload failed for {filename}")
-                continue
-
-            # Text extraction and date extraction run in parallel
-            text, dates = await asyncio.gather(
-                extract_text_via_gemini(uploaded_file, filename),
-                extract_dates_from_pdf(pf["path"], filename),
+        # ── Full index path (Gemini-heavy — throttled by semaphore) ───────
+        async with semaphore:
+            print(f"[INDEX] {filename} — downloading...")
+            loop = asyncio.get_running_loop()
+            pf = await loop.run_in_executor(
+                None, download_single_patent_pdf, ref["blob_name"], filename, drug_name
             )
+            if not pf:
+                print(f"[WARNING] Could not download {filename}")
+                return {"filename": filename, "path": None, "tmp_dir": None}
 
-            if text:
-                await index_text(drug_name, filename, text, collection, dates=dates)
-            else:
-                print(f"[WARNING] No text extracted from {filename}")
+            try:
+                uploaded_file = await upload_pdf_to_gemini(pf["path"])
+                if not uploaded_file:
+                    print(f"[WARNING] Upload failed for {filename}")
+                    return {"filename": filename, "path": None, "tmp_dir": None}
 
-            await cleanup_uploaded_file(uploaded_file)
-            await asyncio.sleep(1 + random.uniform(0, 0.5))
+                # Text extraction and date extraction run in parallel
+                text, dates = await asyncio.gather(
+                    extract_text_via_gemini(uploaded_file, filename),
+                    extract_dates_from_pdf(pf["path"], filename),
+                )
 
-        except Exception as e:
-            print(f"[ERROR] Processing failed for {filename}: {e}")
+                if text:
+                    await _index_text_locked(drug_name, filename, text, collection, dates)
+                    print(
+                        f"[INDEX] {filename} — stored | "
+                        f"Filed: {(dates or {}).get('filing_date') or 'unknown'} | "
+                        f"Granted: {(dates or {}).get('grant_date') or 'unknown'}"
+                    )
+                    if on_indexed:
+                        await on_indexed(filename)
+                else:
+                    print(f"[WARNING] No text extracted from {filename}")
 
-        finally:
-            if pf.get("tmp_dir"):
-                shutil.rmtree(pf["tmp_dir"], ignore_errors=True)
-                print(f"[GCS] Cleaned up temp dir for {filename}")
-                pf["tmp_dir"] = None
+                await cleanup_uploaded_file(uploaded_file)
+                await asyncio.sleep(1 + random.uniform(0, 0.5))
 
-    return downloaded_files
+                return pf
+
+            except Exception as e:
+                print(f"[ERROR] Processing failed for {filename}: {e}")
+                return {"filename": filename, "path": None, "tmp_dir": None}
+
+            finally:
+                if pf.get("tmp_dir"):
+                    shutil.rmtree(pf["tmp_dir"], ignore_errors=True)
+                    print(f"[GCS] Cleaned up temp dir for {filename}")
+                    pf["tmp_dir"] = None
+
+    # ── Dispatch all files concurrently, collect results in order ─────────────
+    results: List[dict] = await asyncio.gather(
+        *[_process_one(ref) for ref in pdf_refs],
+        return_exceptions=False,
+    )
+
+    print(
+        f"[INDEXER] Done — {sum(1 for r in results if r.get('path'))} new file(s) indexed, "
+        f"{sum(1 for r in results if not r.get('path'))} skipped/copied."
+    )
+    return results
