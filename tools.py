@@ -46,7 +46,7 @@ from .indexer import (
     run_indexing,
 )
 
-from .blocking_analyser import run_blocking_analysis, load_formulation_excel
+from .blocking_analyser import load_formulation_excel
 
 from .blocking_analyser import (
     invalidate_drug_cache as invalidate_blocking_cache,
@@ -274,51 +274,226 @@ async def get_dimension_i_patent_data(
                 "from_cache":              True,
             }
 
-    # ── Steps 2–3: Index + cross-collection dedup + date backfill ─────────────
-    print(f"\n[STEPS 2–3] Indexing and date backfill...")
+    # ── Steps 2–5: Pipelined indexing + analysis ─────────────────────────────
+    #
+    # Instead of: index ALL patents → then analyse ALL patents (sequential),
+    # we pipeline so that Step 1 analysis fires per-patent the moment it is
+    # confirmed ready in ChromaDB, overlapped with the clinical timeline fetch.
+    #
+    # Concurrency map:
+    #   • run_indexing    — up to INDEXING_WORKERS (5) patents in parallel
+    #   • Step 1 tasks    — fire immediately on each on_indexed callback,
+    #                       throttled by _ANALYSIS_CONCURRENCY (5) inside
+    #                       blocking_analyser._run_step1_only
+    #   • Timeline fetch  — runs concurrently with both indexing and Step 1
+    #   • Steps 2+ (Phase 2) — run after all Step 1s complete (CoM routing
+    #                       needs the full patent set before it can decide
+    #                       which patent is the primary CoM per jurisdiction)
+    #
+    print(f"\n[STEPS 2–5] Starting pipelined indexing + analysis...")
     collection = get_or_create_collection(drug_name)
 
-    await run_indexing(drug_name, pdf_refs, collection, reindex=reindex)
+    # Import per-patent Step 1 helpers from blocking_analyser
+    from .blocking_analyser import (
+        _run_step1_only,
+        _run_steps2_plus,
+        _build_com_blocking_result,
+        get_drug_rows,
+        load_cached_patents_bulk,
+        store_patent_analysis,
+        invalidate_drug_cache,
+        is_non_analysable_patent,
+        skipped_result,
+        error_result,
+        _print_summary_table,
+    )
+    from pathlib import Path as _Path
 
-    # ── Steps 4–5 (pre): Fetch clinical timeline BEFORE blocking analysis ──────
-    # Needed so Step 3 knows whether to use FDA/EMA reviews (Marketed)
-    # or peer-reviewed journals (Clinical).
-    print(f"\n[STEPS 4–5 PRE] Fetching clinical timeline for Step 3 phase routing...")
-    timeline = await fetch_clinical_timeline(
-        drug_name          = drug_name,
-        bq_table_name      = _bq_table,
-        bq_project_id      = _bq_project,
-        bq_dataset_id      = _bq_dataset,
-        bq_service_account = _bq_sa,
+    # Pre-compute which filenames are analysable (same filter as run_blocking_analysis)
+    all_filenames  = [ref["filename"] for ref in pdf_refs]
+    analysis_files = [f for f in all_filenames if not is_non_analysable_patent(f)]
+    skipped_files  = [f for f in all_filenames if     is_non_analysable_patent(f)]
+
+    # Load per-patent cache (mirrors run_blocking_analysis cache logic)
+    if not reindex:
+        cached_results = load_cached_patents_bulk(drug_name, analysis_files)
+        new_files      = [f for f in analysis_files if f not in cached_results]
+        if cached_results:
+            print(
+                f"[CACHE] {len(cached_results)} patent(s) loaded from cache, "
+                f"{len(new_files)} new patent(s) to analyse"
+            )
+        else:
+            print(f"[CACHE] No cached results — analysing all {len(analysis_files)} patent(s)")
+    else:
+        invalidate_drug_cache(drug_name)
+        cached_results = {}
+        new_files      = analysis_files
+
+    # Step 1 futures: dict[filename → asyncio.Task] for patents that need analysis
+    step1_tasks: dict = {}
+
+    async def _on_indexed(filename: str) -> None:
+        """
+        Callback fired by run_indexing as soon as a patent is ready in ChromaDB.
+        Immediately launches Step 1 analysis for patents not already cached,
+        so analysis overlaps with the remaining indexing work.
+        """
+        if filename in new_files and filename not in step1_tasks:
+            print(f"[PIPELINE] {filename} — indexed, launching Step 1 immediately")
+            step1_tasks[filename] = asyncio.ensure_future(
+                _run_step1_only(filename, collection)
+            )
+
+    # Cached patents are handled directly in the results loop below —
+    # they don't need Step 1 tasks since their full analysis is already stored.
+
+    # Run indexing (fires _on_indexed per patent) and timeline fetch in parallel
+    print(f"[STEPS 2–3] Indexing {len(pdf_refs)} patent(s) with up to 5 workers...")
+    print(f"[STEPS 4–5 PRE] Fetching clinical timeline concurrently...")
+
+    _, timeline = await asyncio.gather(
+        run_indexing(drug_name, pdf_refs, collection, reindex=reindex, on_indexed=_on_indexed),
+        fetch_clinical_timeline(
+            drug_name          = drug_name,
+            bq_table_name      = _bq_table,
+            bq_project_id      = _bq_project,
+            bq_dataset_id      = _bq_dataset,
+            bq_service_account = _bq_sa,
+        ),
     )
 
-    # Convert to {jurisdiction: phase} for blocking analyser
-    geography_stages = timeline.get("geography_stages", {})
-    drug_phase = {
-        "US": geography_stages.get("United States"),
-        "EP": geography_stages.get("EU"),
-    }
-    # Add all other geographies found
+    # Build drug_phase from timeline (same logic as before)
     _GEO_TO_JUR = {
         "United States": "US", "EU": "EP", "Japan": "JP", "China": "CN",
         "India": "IN", "South Korea": "KR", "Australia": "AU", "Canada": "CA",
         "Brazil": "BR", "Mexico": "MX", "Russia": "RU",
     }
+    geography_stages = timeline.get("geography_stages", {})
+    drug_phase = {"US": geography_stages.get("United States"), "EP": geography_stages.get("EU")}
     for geo_name, phase in geography_stages.items():
         jur = _GEO_TO_JUR.get(geo_name)
         if jur and jur not in drug_phase:
             drug_phase[jur] = phase
-
     phase_summary = " | ".join(f"{k}: {v}" for k, v in sorted(drug_phase.items()) if v)
     print(f"[STEPS 4–5 PRE] Drug phase → {phase_summary}")
 
-    # ── Steps 4–5: Blocking analysis + business rules ─────────────────────────
-    print(f"\n[STEPS 4–5] Running blocking analysis...")
-    patents = await run_blocking_analysis(
-        drug_name, pdf_refs, collection, drug_phase=drug_phase,
-        force_reanalyse=reindex,
-    )
-    print(f"[STEPS 4–5] {len(patents)} patent(s) analysed")
+    # Any new patents not yet triggered (e.g. indexing failed to extract text)
+    # still need a Step 1 attempt — ensure they're all launched before we await
+    for filename in new_files:
+        if filename not in step1_tasks:
+            print(f"[PIPELINE] {filename} — not indexed successfully, attempting Step 1 anyway")
+            step1_tasks[filename] = asyncio.ensure_future(
+                _run_step1_only(filename, collection)
+            )
+
+    # Await all Step 1 tasks (most are already done or nearly done)
+    if step1_tasks:
+        print(f"[STEPS 4–5] Awaiting {len(step1_tasks)} Step 1 task(s)...")
+        step1_results_list = await asyncio.gather(
+            *step1_tasks.values(), return_exceptions=True
+        )
+        new_phase1_results = dict(zip(step1_tasks.keys(), step1_results_list))
+    else:
+        new_phase1_results = {}
+
+    # ── CoM routing (identical to run_blocking_analysis logic) ───────────────
+    # Build unified phase1 view across cached + new patents
+    all_phase1 = []
+    for filename, cached_patent in cached_results.items():
+        all_phase1.append({
+            "filename":      filename,
+            "patent_number": cached_patent.get("patent_number", _Path(filename).stem),
+            "jurisdiction":  (cached_patent.get("jurisdiction") or "").upper(),
+            "is_com":        cached_patent.get("claim_category") == "Composition of Matter"
+                             and cached_patent.get("tag") == "BLOCKING",
+            "filing_date":   cached_patent.get("filing_date"),
+            "_from_cache":   True,
+        })
+    for filename, result in new_phase1_results.items():
+        if isinstance(result, Exception) or result is None:
+            all_phase1.append({"filename": filename, "_failed": True})
+        else:
+            result["_from_cache"] = False
+            all_phase1.append(result)
+
+    primary_com_filenames: set = set()
+    all_jurisdictions = sorted(set(
+        r.get("jurisdiction") for r in all_phase1
+        if isinstance(r, dict) and r.get("jurisdiction") and not r.get("_failed")
+    ))
+    print(f"[CoM ROUTING] Jurisdictions found: {all_jurisdictions}")
+    for jurisdiction in all_jurisdictions:
+        com_candidates = [
+            r for r in all_phase1
+            if isinstance(r, dict) and not r.get("_failed")
+            and r.get("is_com") and r.get("jurisdiction") == jurisdiction
+        ]
+        if not com_candidates:
+            continue
+        com_candidates.sort(key=lambda r: r.get("filing_date") or "9999-99-99")
+        primary = com_candidates[0]
+        primary_com_filenames.add(primary["filename"])
+        print(
+            f"[CoM ROUTING] Primary CoM for {jurisdiction}: "
+            f"{primary.get('patent_number', '?')} (filed: {primary.get('filing_date') or 'unknown'})"
+            f" → BLOCKING (skips Steps 2+)"
+        )
+        for secondary in com_candidates[1:]:
+            print(
+                f"[CoM ROUTING] Secondary CoM for {jurisdiction}: "
+                f"{secondary.get('patent_number', '?')} → sent to Steps 2+ as Formulation-class"
+            )
+
+    # ── Build results: cached + route new patents to Phase 2 ─────────────────
+    drug_rows = get_drug_rows(drug_name)
+    patents: list = []
+    phase2_inputs: list = []
+
+    for filename, cached_patent in cached_results.items():
+        patents.append(cached_patent)
+        print(f"[RESULT] {filename} → from cache ({cached_patent.get('tag', '?')})")
+
+    for filename, result in new_phase1_results.items():
+        if isinstance(result, Exception) or result is None:
+            print(f"[ERROR] Phase 1 failed for {filename}: {result}")
+            patents.append(error_result(filename))
+            continue
+        if filename in primary_com_filenames:
+            com_result = _build_com_blocking_result(result)
+            patents.append(com_result)
+            store_patent_analysis(drug_name, filename, com_result)
+            print(f"[RESULT] {filename} → NEW primary CoM BLOCKING (cached)")
+        else:
+            if result.get("step1", {}).get("claim_category") == "Composition of Matter":
+                result["step1"]["claim_category"] = "Formulation"
+                result["step1"]["is_composition_of_matter"] = False
+                print(
+                    f"[CoM ROUTING] {result.get('patent_number')} reclassified: "
+                    f"Composition of Matter → Formulation"
+                )
+            phase2_inputs.append(result)
+
+    if phase2_inputs:
+        print(f"\n[PHASE 2] Running Steps 2+ on {len(phase2_inputs)} patent(s) in parallel...")
+        phase2_results = await asyncio.gather(
+            *[_run_steps2_plus(p, drug_name, drug_rows, drug_phase) for p in phase2_inputs],
+            return_exceptions=True,
+        )
+        for phase1_data, result in zip(phase2_inputs, phase2_results):
+            if isinstance(result, Exception):
+                print(f"[ERROR] Phase 2 failed for {phase1_data['filename']}: {result}")
+                patents.append(error_result(phase1_data["filename"]))
+            else:
+                patents.append(result)
+                store_patent_analysis(drug_name, phase1_data["filename"], result)
+                print(f"[RESULT] {phase1_data['filename']} → NEW {result.get('tag', '?')} (cached)")
+
+    for filename in skipped_files:
+        patents.append(skipped_result(filename))
+
+    _print_summary_table(drug_name, patents)
+    print(f"[STEPS 2–5] {len(patents)} patent(s) analysed")
 
     # ── Steps 6–7: Assign phase per patent (timeline already fetched above) ───
     print(f"\n[STEPS 6–7] Assigning clinical phase to patents...")
