@@ -1,0 +1,3 @@
+pip install google-cloud-storage google-cloud-bigquery google-generativeai \
+            google-adk chromadb pymupdf pandas openpyxl python-dotenv \
+            beautifulsoup4 requests
