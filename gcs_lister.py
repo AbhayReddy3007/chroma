@@ -108,8 +108,15 @@ def list_drug_pdf_filenames_from_gcs(drug_name: str) -> List[dict]:
         print(f"[GCS] No PDFs found in gs://{GCS_BUCKET_NAME}/{matched_prefix}")
         return []
 
+    # Use the path relative to the drug folder as the filename so that PDFs
+    # in different subfolders with the same basename don't collide.
+    # e.g. Patents/Axitinib/US/patent.pdf  → filename = "US/patent.pdf"
+    #      Patents/Axitinib/EP/patent.pdf  → filename = "EP/patent.pdf"
     result = [
-        {"filename": Path(b.name).name, "blob_name": b.name}
+        {
+            "filename":  b.name[len(matched_prefix):],  # subfolder-relative path
+            "blob_name": b.name,
+        }
         for b in sorted(pdf_blobs, key=lambda b: b.name)
     ]
     print(f"[GCS] Found {len(result)} PDF(s): {[r['filename'] for r in result]}")
