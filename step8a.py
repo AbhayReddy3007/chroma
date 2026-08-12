@@ -185,7 +185,7 @@ def _load_step7_skeletons(drug_name: str, patent_filter: Optional[str] = None) -
     return skeletons
 
 
-def _ensure_step7(drug_name: str, force: bool = False) -> None:
+async def _ensure_step7(drug_name: str, force: bool = False) -> None:
     """Run step7 if no skeletons exist for drug."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
     existing = list(STEP7_OUTPUT_DIR.glob(f"{safe}_*_claim_skeleton.json"))
@@ -200,7 +200,7 @@ def _ensure_step7(drug_name: str, force: bool = False) -> None:
         mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         process_drug = mod.process_drug
-    asyncio.get_event_loop().run_until_complete(process_drug(drug_name=drug_name))
+    await process_drug(drug_name=drug_name)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -541,7 +541,7 @@ async def process_drug(
     rerun_step7:   bool          = False,
     output_dir:    Path          = STEP8A_OUTPUT_DIR,
 ) -> list[dict]:
-    _ensure_step7(drug_name, force=rerun_step7)
+    await _ensure_step7(drug_name, force=rerun_step7)
 
     skeletons = _load_step7_skeletons(drug_name, patent_filter=patent_filter)
     if not skeletons:
