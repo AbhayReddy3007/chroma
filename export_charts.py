@@ -22,21 +22,45 @@ import json
 import os
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import Optional
 
-# Load .env if present (python-dotenv)
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# ─────────────────────────────────────────────────────────────
+# Load .env (explicitly from the script's own directory first,
+# then fall back to python-dotenv's normal cwd-based search).
+# This matters because GCS_SERVICE_ACCOUNT is read from here —
+# if the .env isn't found, the BigQuery client silently falls
+# back to ADC (application default credentials), which is the
+# most common cause of "Could not create BigQuery client".
+# ─────────────────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import load_dotenv, find_dotenv
+
+    _env_path = SCRIPT_DIR / ".env"
+    if _env_path.exists():
+        load_dotenv(dotenv_path=_env_path, override=True)
+        print(f"[ENV] Loaded .env from {_env_path}")
+    else:
+        found = find_dotenv(usecwd=True)
+        if found:
+            load_dotenv(found, override=True)
+            print(f"[ENV] Loaded .env from {found}")
+        else:
+            print(f"[ENV] No .env file found (looked in {SCRIPT_DIR} and cwd). "
+                  f"GCS_SERVICE_ACCOUNT must be set as a real environment variable instead.")
 except ImportError:
-    pass
+    print("[ENV] python-dotenv not installed (`pip install python-dotenv`) — "
+          "a .env file will NOT be read. Set GCS_SERVICE_ACCOUNT as an actual "
+          "environment variable, or install python-dotenv.")
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-STEP9_OUTPUT_DIR = Path(__file__).parent / "step9_output"
+STEP9_OUTPUT_DIR = SCRIPT_DIR / "step9_output"
 BQ_TABLE         = os.getenv("BQ_PATENT_TABLE",
                              "prj-portfolio-ai-dev.portfolio_data.patent_discovery")
 
@@ -50,6 +74,81 @@ def _strip_underscores(patent_number: str) -> str:
     return patent_number.replace("_", "")
 
 
+def _make_bq_client():
+    """
+    Build a BigQuery client, preferring GCS_SERVICE_ACCOUNT (path to a
+    service-account JSON key) over application default credentials.
+
+    Returns (client, error_message). If client is None, error_message
+    explains exactly why.
+    """
+    try:
+        from google.cloud import bigquery
+    except ImportError:
+        return None, ("google-cloud-bigquery is not installed. "
+                       "Run: pip install google-cloud-bigquery google-auth")
+
+    sa_path = os.getenv("GCS_SERVICE_ACCOUNT")
+
+    if sa_path:
+        sa_path = os.path.expanduser(sa_path.strip())
+        # Resolve relative paths against the script directory, not the cwd,
+        # so it works the same whether you run this from the project root
+        # or from inside step9_output/ etc.
+        candidate = Path(sa_path)
+        if not candidate.is_absolute():
+            candidate = (SCRIPT_DIR / candidate).resolve()
+
+        if not candidate.exists():
+            return None, (f"GCS_SERVICE_ACCOUNT is set to '{sa_path}' but no file "
+                           f"exists there (resolved to '{candidate}'). Check the path "
+                           f"in your .env — it should point at the service-account "
+                           f"JSON key file, e.g. GCS_SERVICE_ACCOUNT=./keys/sa.json")
+
+        try:
+            key_data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception as e:
+            return None, (f"GCS_SERVICE_ACCOUNT points at '{candidate}' but it isn't "
+                           f"valid JSON ({e}). Make sure it's the downloaded service "
+                           f"account key file, not something else.")
+
+        missing = [k for k in ("type", "project_id", "private_key", "client_email")
+                   if k not in key_data]
+        if missing:
+            return None, (f"'{candidate}' doesn't look like a service-account key "
+                           f"(missing fields: {missing}). Download a fresh key from "
+                           f"GCP Console → IAM & Admin → Service Accounts → Keys.")
+
+        try:
+            from google.oauth2 import service_account
+        except ImportError:
+            return None, "google-auth is not installed. Run: pip install google-auth"
+
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                str(candidate),
+                scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+            )
+            client = bigquery.Client(credentials=credentials,
+                                     project=credentials.project_id)
+            print(f"[BQ] Authenticated via GCS_SERVICE_ACCOUNT: {candidate} "
+                  f"(project={credentials.project_id})")
+            return client, None
+        except Exception as e:
+            return None, (f"Failed to build a client from '{candidate}': {e}")
+
+    # No GCS_SERVICE_ACCOUNT set at all — fall back to ADC, but say so loudly.
+    print("[BQ] GCS_SERVICE_ACCOUNT not set — falling back to application default "
+          "credentials (gcloud auth application-default login). If that's not what "
+          "you intended, add GCS_SERVICE_ACCOUNT=/path/to/key.json to your .env.")
+    try:
+        client = bigquery.Client()
+        return client, None
+    except Exception as e:
+        return None, (f"No GCS_SERVICE_ACCOUNT set and application default "
+                       f"credentials failed too: {e}")
+
+
 def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     """
     Query BigQuery for all patent numbers in one batched call.
@@ -61,29 +160,12 @@ def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     if not patent_numbers:
         return {}
 
-    try:
-        from google.cloud import bigquery
-    except ImportError:
-        print("[BQ] google-cloud-bigquery not installed — Filed By will be blank.")
-        return {}
-
-    try:
-        sa_path = os.getenv("GCS_SERVICE_ACCOUNT")
-        if sa_path:
-            from google.oauth2 import service_account
-            credentials = service_account.Credentials.from_service_account_file(
-                sa_path,
-                scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
-            )
-            client = bigquery.Client(credentials=credentials,
-                                     project=credentials.project_id)
-            print(f"[BQ] Authenticated via GCS_SERVICE_ACCOUNT: {sa_path}")
-        else:
-            client = bigquery.Client()
-            print("[BQ] GCS_SERVICE_ACCOUNT not set — using application default credentials")
-    except Exception as e:
-        print(f"[BQ] Could not create BigQuery client: {e} — Filed By will be blank.")
-        return {}
+    client, err = _make_bq_client()
+    if client is None:
+        print(f"[BQ] Could not create BigQuery client: {err}")
+        print("[BQ] Filed By will show 'Unknown' for all patents. "
+              "Use --no_bq to skip this step silently next time.")
+        return {p: "Unknown" for p in patent_numbers}
 
     # Build two sets: original and stripped variants
     originals = list(dict.fromkeys(patent_numbers))   # deduplicated, order preserved
@@ -103,8 +185,10 @@ def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     try:
         rows = list(client.query(query).result())
     except Exception as e:
-        print(f"[BQ] Query failed: {e} — Filed By will be blank.")
-        return {}
+        print(f"[BQ] Query failed: {e}")
+        traceback.print_exc()
+        print("[BQ] Filed By will show 'Unknown' for all patents.")
+        return {p: "Unknown" for p in patent_numbers}
 
     # Index results: patent_number → best assignee value
     bq_index: dict[str, str] = {}
