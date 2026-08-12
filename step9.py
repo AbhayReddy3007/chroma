@@ -142,7 +142,7 @@ def _load_all_inputs(drug_name: str, patent_number: str) -> dict:
     }
 
 
-def _ensure_step8b(drug_name: str, force: bool = False) -> None:
+async def _ensure_step8b(drug_name: str, force: bool = False) -> None:
     safe     = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
     existing = list(STEP8B_OUTPUT_DIR.glob(f"{safe}_*_grounds.json"))
     existing = [f for f in existing if "_all_grounds" not in f.name]
@@ -157,15 +157,7 @@ def _ensure_step8b(drug_name: str, force: bool = False) -> None:
         mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         run_for_drug = mod.run_for_drug
-    # step8b.run_for_drug is now async
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        asyncio.ensure_future(run_for_drug(drug_name=drug_name))
-    else:
-        asyncio.run(run_for_drug(drug_name=drug_name))
+    await run_for_drug(drug_name=drug_name)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -871,13 +863,13 @@ def process_patent(
 # Main runner
 # ─────────────────────────────────────────────────────────────
 
-def run_for_drug(
+async def run_for_drug(
     drug_name:     str,
     patent_filter: Optional[str] = None,
     rerun_all:     bool          = False,
     output_dir:    Path          = STEP9_OUTPUT_DIR,
 ) -> list[dict]:
-    _ensure_step8b(drug_name, force=rerun_all)
+    await _ensure_step8b(drug_name, force=rerun_all)
 
     # Discover all patents from step8b grounds files
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
@@ -938,12 +930,12 @@ def main() -> None:
     print(f"[Step 9] Patent     : {args.patent or 'all'}")
     print(f"[Step 9] Output     : {output_dir.resolve()}")
 
-    results = run_for_drug(
+    results = asyncio.run(run_for_drug(
         drug_name     = args.drug,
         patent_filter = args.patent,
         rerun_all     = args.rerun_all,
         output_dir    = output_dir,
-    )
+    ))
 
     total_charts = sum(len(r.get("charts", [])) for r in results)
     total_gaps   = sum(len(r.get("gap_list", [])) for r in results)
