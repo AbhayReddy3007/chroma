@@ -48,9 +48,20 @@ CHROMA_DB_PATH   = str(Path(__file__).parent / "chroma_patent_db")
 # Gemini client
 # ─────────────────────────────────────────────────────────────
 
-_api_key      = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=_api_key)
-MODEL         = "gemini-2.5-flash-preview-05-20"
+MODEL          = "gemini-2.5-flash-preview-05-20"
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is not set.\n"
+                "Add it to your .env file or set it in your shell before running."
+            )
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB — lazy init so import doesn't crash if chromadb absent
@@ -389,7 +400,7 @@ async def decompose_patent(item: dict) -> Optional[dict]:
     )
 
     try:
-        response = await gemini_client.aio.models.generate_content(
+        response = await _get_gemini_client().aio.models.generate_content(
             model    = MODEL,
             contents = prompt,
             config   = config,
