@@ -1,14 +1,34 @@
-(cognito) C:\Users\P90022569\Downloads\indexing\indexing\chroma_main>python step9.py
+[Step 9] Drug       : Minocycline
+[Step 9] Patent     : all
+[Step 9] Output     : C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9_output
+[Step 9] Step 8b output not found — running step8b for 'Minocycline'...
+[Step 8b] Step 8a output not found — running step8a for 'Minocycline'...
 Traceback (most recent call last):
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 56, in <module>
-    gemini_client = genai.Client(api_key=_api_key)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\genai\client.py", line 426, in __init__
-    self._api_client = self._get_api_client(
-                       ^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\genai\client.py", line 474, in _get_api_client
-    return BaseApiClient(
-           ^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\genai\_api_client.py", line 690, in __init__
-    raise ValueError(
-ValueError: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 957, in <module>
+    main()
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 941, in main
+    results = run_for_drug(
+              ^^^^^^^^^^^^^
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 880, in run_for_drug
+    _ensure_step8b(drug_name, force=rerun_all)
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 168, in _ensure_step8b
+    asyncio.run(run_for_drug(drug_name=drug_name))
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step8b.py", line 776, in run_for_drug
+    _ensure_step8a(drug_name, force=rerun_step8a)
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step8b.py", line 200, in _ensure_step8a
+    asyncio.get_event_loop().run_until_complete(process_drug(drug_name=drug_name))
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 630, in run_until_complete
+    self._check_running()
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 589, in _check_running
+    raise RuntimeError('This event loop is already running')
+RuntimeError: This event loop is already running
+sys:1: RuntimeWarning: coroutine 'process_drug' was never awaited
