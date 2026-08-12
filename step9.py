@@ -56,6 +56,7 @@ ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent 
 
 MODEL          = "gemini-2.5-flash-preview-05-20"
 _gemini_client = None
+_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 def _get_gemini_client():
     global _gemini_client
@@ -798,7 +799,7 @@ def _render_excel(drug_name: str, chart_data: dict, output_dir: Path) -> Optiona
     print(f"  → Excel workbook  : {xlsx_path}")
     return str(xlsx_path)
 
-def process_patent(
+async def process_patent(
     drug_name:      str,
     patent_number:  str,
     output_dir:     Path,
@@ -891,12 +892,25 @@ async def run_for_drug(
         print(f"[Step 9] No patents found for '{drug_name}'.")
         return []
 
-    print(f"[Step 9] Assembling charts for {len(patent_numbers)} patent(s)...")
+    print(f"[Step 9] Assembling charts for {len(patent_numbers)} patent(s) "
+          f"(up to {_WORKERS} workers)...")
+
+    sem = asyncio.Semaphore(_WORKERS)
+
+    async def _bounded(pn):
+        async with sem:
+            return await process_patent(drug_name, pn, output_dir)
+
+    raw = await asyncio.gather(
+        *[_bounded(pn) for pn in patent_numbers],
+        return_exceptions=True,
+    )
 
     results = []
-    for pn in patent_numbers:
-        result = process_patent(drug_name, pn, output_dir)
-        if result:
+    for pn, result in zip(patent_numbers, raw):
+        if isinstance(result, Exception):
+            print(f"[Step 9] ⚠  {pn} raised: {result}")
+        elif result:
             results.append(result)
 
     if results:
