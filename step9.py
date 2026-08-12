@@ -49,12 +49,26 @@ CHROMA_DB_PATH     = str(Path(__file__).parent / "chroma_patent_db")
 ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent / "analysis_cache"))
 
 # ─────────────────────────────────────────────────────────────
-# Gemini
+# Gemini — lazy init so missing API key doesn't crash on import
+# (step9 itself makes no Gemini calls; the import is for type
+#  hints only — but step8b bootstrapping may need it)
 # ─────────────────────────────────────────────────────────────
 
-_api_key      = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=_api_key)
-MODEL         = "gemini-2.5-flash-preview-05-20"
+MODEL          = "gemini-2.5-flash-preview-05-20"
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.\n"
+                "Step 9 itself makes no Gemini calls, but upstream steps (7, 8a, 8b) do.\n"
+                "Set it in your .env or environment before running."
+            )
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB + analysis cache (reuse helpers)
