@@ -25,6 +25,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Load .env if present (python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -61,7 +68,19 @@ def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
         return {}
 
     try:
-        client = bigquery.Client()
+        sa_path = os.getenv("GCS_SERVICE_ACCOUNT")
+        if sa_path:
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_file(
+                sa_path,
+                scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+            )
+            client = bigquery.Client(credentials=credentials,
+                                     project=credentials.project_id)
+            print(f"[BQ] Authenticated via GCS_SERVICE_ACCOUNT: {sa_path}")
+        else:
+            client = bigquery.Client()
+            print("[BQ] GCS_SERVICE_ACCOUNT not set — using application default credentials")
     except Exception as e:
         print(f"[BQ] Could not create BigQuery client: {e} — Filed By will be blank.")
         return {}
