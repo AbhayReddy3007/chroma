@@ -56,6 +56,7 @@ ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent 
 
 MODEL          = "gemini-2.5-flash-preview-05-20"
 _gemini_client = None
+_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 def _get_gemini_client():
     global _gemini_client
@@ -670,12 +671,25 @@ async def process_patent(
         claim_numbers = [c["claim_number"] for c in skeleton.get("independent_claims", [])]
 
     all_claim_grounds = []
-    for cn in claim_numbers:
-        result = await _build_claim_grounds(
-            patent_number, drug_name, cn, priority_date,
-            limitation_results, patent_text, analysis_cache,
+    if claim_numbers:
+        sem = asyncio.Semaphore(_WORKERS)
+
+        async def _bounded_claim(cn):
+            async with sem:
+                return await _build_claim_grounds(
+                    patent_number, drug_name, cn, priority_date,
+                    limitation_results, patent_text, analysis_cache,
+                )
+
+        claim_results = await asyncio.gather(
+            *[_bounded_claim(cn) for cn in claim_numbers],
+            return_exceptions=True,
         )
-        all_claim_grounds.append(result)
+        for cn, res in zip(claim_numbers, claim_results):
+            if isinstance(res, Exception):
+                print(f"[Step 8b] ⚠  Claim {cn} raised: {res}")
+            else:
+                all_claim_grounds.append(res)
 
     output = {
         "patent_number": patent_number,
@@ -780,15 +794,29 @@ async def run_for_drug(
         print(f"[Step 8b] No step8a data for '{drug_name}'.")
         return []
 
-    print(f"[Step 8b] Processing {len(prior_art_results)} patent(s) for '{drug_name}'...")
+    print(f"[Step 8b] Processing {len(prior_art_results)} patent(s) for '{drug_name}' "
+          f"(up to {_WORKERS} workers)...")
+
+    sem = asyncio.Semaphore(_WORKERS)
+
+    async def _bounded(pa):
+        async with sem:
+            pn       = pa["patent_number"]
+            skeleton = _load_step7_skeleton(drug_name, pn)
+            return await process_patent(pa, skeleton)
+
+    raw = await asyncio.gather(
+        *[_bounded(pa) for pa in prior_art_results],
+        return_exceptions=True,
+    )
 
     results = []
-    for pa in prior_art_results:
-        pn       = pa["patent_number"]
-        skeleton = _load_step7_skeleton(drug_name, pn)
-        result   = await process_patent(pa, skeleton)
-        _write_output(drug_name, result, output_dir)
-        results.append(result)
+    for pa, result in zip(prior_art_results, raw):
+        if isinstance(result, Exception):
+            print(f"[Step 8b] ⚠  {pa['patent_number']} raised: {result}")
+        else:
+            _write_output(drug_name, result, output_dir)
+            results.append(result)
 
     if results:
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
