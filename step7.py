@@ -50,6 +50,7 @@ CHROMA_DB_PATH   = str(Path(__file__).parent / "chroma_patent_db")
 
 MODEL          = "gemini-2.5-flash-preview-05-20"
 _gemini_client = None
+_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))  # shared across steps 7-9
 
 def _get_gemini_client():
     global _gemini_client
@@ -543,12 +544,24 @@ async def process_drug(
             print(f"[Step 7] No patent at priority {priority_filter} for '{drug_name}'.")
             return []
 
-    print(f"[Step 7] Processing {len(queue)} patent(s) for '{drug_name}'...")
+    print(f"[Step 7] Processing {len(queue)} patent(s) for '{drug_name}' "
+          f"(up to {_WORKERS} workers)...")
+
+    sem = asyncio.Semaphore(_WORKERS)
+
+    async def _bounded(item):
+        async with sem:
+            return await decompose_patent(item)
+
+    items   = sorted(queue, key=lambda x: x.get("charting_priority") or 999)
+    raw     = await asyncio.gather(*[_bounded(item) for item in items],
+                                   return_exceptions=True)
 
     results = []
-    for item in sorted(queue, key=lambda x: x.get("charting_priority") or 999):
-        result = await decompose_patent(item)
-        if result:
+    for item, result in zip(items, raw):
+        if isinstance(result, Exception):
+            print(f"[Step 7] ⚠  {item['patent_number']} raised: {result}")
+        elif result:
             _write_patent_output(drug_name, result, output_dir)
             results.append(result)
         else:
