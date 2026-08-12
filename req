@@ -1,34 +1,5 @@
-[Step 9] Drug       : Minocycline
-[Step 9] Patent     : all
-[Step 9] Output     : C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9_output
-[Step 9] Step 8b output not found — running step8b for 'Minocycline'...
-[Step 8b] Step 8a output not found — running step8a for 'Minocycline'...
-Traceback (most recent call last):
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 957, in <module>
-    main()
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 941, in main
-    results = run_for_drug(
-              ^^^^^^^^^^^^^
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 880, in run_for_drug
-    _ensure_step8b(drug_name, force=rerun_all)
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 168, in _ensure_step8b
-    asyncio.run(run_for_drug(drug_name=drug_name))
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 190, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 654, in run_until_complete
-    return future.result()
-           ^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step8b.py", line 776, in run_for_drug
-    _ensure_step8a(drug_name, force=rerun_step8a)
-  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step8b.py", line 200, in _ensure_step8a
-    asyncio.get_event_loop().run_until_complete(process_drug(drug_name=drug_name))
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 630, in run_until_complete
-    self._check_running()
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\asyncio\base_events.py", line 589, in _check_running
-    raise RuntimeError('This event loop is already running')
-RuntimeError: This event loop is already running
-sys:1: RuntimeWarning: coroutine 'process_drug' was never awaited
+query = """
+SELECT eval_actual_assignee, assignee
+FROM `prj-portfolio-ai-dev.portfolio_data.patent_discovery`
+WHERE patent_number = 'US_12534530_B2'
+"""
