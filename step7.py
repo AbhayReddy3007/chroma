@@ -526,6 +526,7 @@ async def process_drug(
     patent_filter:   Optional[str]  = None,
     priority_filter: Optional[int]  = None,
     rerun_step6:     bool           = False,
+    rerun:           bool           = False,   # if True, re-decompose even if output exists
     output_dir:      Path           = STEP7_OUTPUT_DIR,
 ) -> list[dict]:
     queue = _ensure_step6(drug_name, force=rerun_step6)
@@ -544,28 +545,56 @@ async def process_drug(
             print(f"[Step 7] No patent at priority {priority_filter} for '{drug_name}'.")
             return []
 
-    print(f"[Step 7] Processing {len(queue)} patent(s) for '{drug_name}' "
+    # ── Skip already-decomposed patents ──────────────────────
+    safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    todo:    list[dict] = []   # needs Gemini call
+    cached:  list[dict] = []   # load from disk
+
+    for item in sorted(queue, key=lambda x: x.get("charting_priority") or 999):
+        safe_patent = re.sub(r"[^a-zA-Z0-9_-]", "_", item["patent_number"])
+        skeleton_path = output_dir / f"{safe_drug}_{safe_patent}_claim_skeleton.json"
+
+        if not rerun and skeleton_path.exists():
+            try:
+                existing = json.loads(skeleton_path.read_text(encoding="utf-8"))
+                if "error" not in existing:
+                    print(f"[Step 7] [SKIP] {item['patent_number']} — already decomposed")
+                    cached.append(existing)
+                    continue
+            except Exception:
+                pass   # corrupted file — re-decompose
+
+        todo.append(item)
+
+    n_skip = len(cached)
+    n_todo = len(todo)
+    print(f"[Step 7] {drug_name}: {n_skip} cached, {n_todo} to decompose "
           f"(up to {_WORKERS} workers)...")
 
-    sem = asyncio.Semaphore(_WORKERS)
+    # ── Decompose remaining patents in parallel ───────────────
+    new_results: list[dict] = []
+    if todo:
+        sem = asyncio.Semaphore(_WORKERS)
 
-    async def _bounded(item):
-        async with sem:
-            return await decompose_patent(item)
+        async def _bounded(item):
+            async with sem:
+                return await decompose_patent(item)
 
-    items   = sorted(queue, key=lambda x: x.get("charting_priority") or 999)
-    raw     = await asyncio.gather(*[_bounded(item) for item in items],
+        raw = await asyncio.gather(*[_bounded(item) for item in todo],
                                    return_exceptions=True)
 
-    results = []
-    for item, result in zip(items, raw):
-        if isinstance(result, Exception):
-            print(f"[Step 7] ⚠  {item['patent_number']} raised: {result}")
-        elif result:
-            _write_patent_output(drug_name, result, output_dir)
-            results.append(result)
-        else:
-            print(f"[Step 7] ⚠  Skipping {item['patent_number']} — decomposition failed.")
+        for item, result in zip(todo, raw):
+            if isinstance(result, Exception):
+                print(f"[Step 7] ⚠  {item['patent_number']} raised: {result}")
+            elif result:
+                _write_patent_output(drug_name, result, output_dir)
+                new_results.append(result)
+            else:
+                print(f"[Step 7] ⚠  Skipping {item['patent_number']} — decomposition failed.")
+
+    results = cached + new_results
 
     if results:
         _write_drug_summary(drug_name, results, output_dir)
@@ -588,6 +617,8 @@ def main() -> None:
                         help="Process only this charting_priority")
     parser.add_argument("--rerun_step6", action="store_true",
                         help="Force re-run step6 before step7")
+    parser.add_argument("--rerun",       action="store_true",
+                        help="Re-decompose all patents even if output already exists")
     parser.add_argument("--output_dir",  default=str(STEP7_OUTPUT_DIR))
     args = parser.parse_args()
 
@@ -606,6 +637,7 @@ def main() -> None:
         patent_filter   = args.patent,
         priority_filter = args.priority,
         rerun_step6     = args.rerun_step6,
+        rerun           = args.rerun,
         output_dir      = output_dir,
     ))
 
