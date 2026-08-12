@@ -182,7 +182,7 @@ def _load_step7_skeleton(drug_name: str, patent_number: str) -> Optional[dict]:
     return None
 
 
-def _ensure_step8a(drug_name: str, force: bool = False) -> None:
+async def _ensure_step8a(drug_name: str, force: bool = False) -> None:
     safe     = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
     existing = list(STEP8A_OUTPUT_DIR.glob(f"{safe}_*_prior_art.json"))
     existing = [f for f in existing if "_all_prior_art" not in f.name]
@@ -197,7 +197,7 @@ def _ensure_step8a(drug_name: str, force: bool = False) -> None:
         mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         process_drug = mod.process_drug
-    asyncio.get_event_loop().run_until_complete(process_drug(drug_name=drug_name))
+    await process_drug(drug_name=drug_name)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -773,7 +773,7 @@ async def run_for_drug(
     rerun_step8a:  bool          = False,
     output_dir:    Path          = STEP8B_OUTPUT_DIR,
 ) -> list[dict]:
-    _ensure_step8a(drug_name, force=rerun_step8a)
+    await _ensure_step8a(drug_name, force=rerun_step8a)
 
     prior_art_results = _load_step8a(drug_name, patent_filter=patent_filter)
     if not prior_art_results:
