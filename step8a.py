@@ -48,6 +48,7 @@ ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR",   Path(__file__).paren
 
 MODEL          = "gemini-2.5-flash-preview-05-20"
 _gemini_client = None
+_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 def _get_gemini_client():
     global _gemini_client
@@ -470,16 +471,28 @@ async def process_patent(skeleton: dict) -> dict:
     else:
         print(f"[Step 8a] ⚠ No analysis cache")
 
-    # ── Process each independent claim ────────────────────────
+    # ── Process each independent claim in parallel ────────────
     claims = skeleton.get("independent_claims", [])
     all_limitation_results: list[dict] = []
 
-    for claim in claims:
-        cn = claim.get("claim_number", "?")
-        lim_results = await _search_prior_art_for_claim(
-            skeleton, claim, patent_text, analysis_cache
+    if claims:
+        sem = asyncio.Semaphore(_WORKERS)
+
+        async def _bounded_claim(claim):
+            async with sem:
+                return await _search_prior_art_for_claim(
+                    skeleton, claim, patent_text, analysis_cache
+                )
+
+        claim_results = await asyncio.gather(
+            *[_bounded_claim(claim) for claim in claims],
+            return_exceptions=True,
         )
-        all_limitation_results.extend(lim_results)
+        for claim, res in zip(claims, claim_results):
+            if isinstance(res, Exception):
+                print(f"[Step 8a] ⚠  Claim {claim.get('claim_number')} raised: {res}")
+            else:
+                all_limitation_results.extend(res)
 
     output = {
         "patent_number": patent_number,
@@ -548,11 +561,27 @@ async def process_drug(
         print(f"[Step 8a] No skeletons to process for '{drug_name}'.")
         return []
 
+    print(f"[Step 8a] Processing {len(skeletons)} patent(s) for '{drug_name}' "
+          f"(up to {_WORKERS} workers)...")
+
+    sem = asyncio.Semaphore(_WORKERS)
+
+    async def _bounded(skel):
+        async with sem:
+            return await process_patent(skel)
+
+    raw = await asyncio.gather(
+        *[_bounded(skel) for skel in skeletons],
+        return_exceptions=True,
+    )
+
     results = []
-    for skel in skeletons:
-        result = await process_patent(skel)
-        _write_output(drug_name, result, output_dir)
-        results.append(result)
+    for skel, result in zip(skeletons, raw):
+        if isinstance(result, Exception):
+            print(f"[Step 8a] ⚠  {skel.get('patent_number')} raised: {result}")
+        else:
+            _write_output(drug_name, result, output_dir)
+            results.append(result)
 
     # Combined summary
     if results:
