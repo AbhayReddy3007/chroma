@@ -1,5 +1,2 @@
-query = """
-SELECT eval_actual_assignee, assignee
-FROM `prj-portfolio-ai-dev.portfolio_data.patent_discovery`
-WHERE patent_number = 'US_12534530_B2'
-"""
+SELECT `Trial_Title`, `Trial_Status`, `Trial_Phase`, `Cleaned_Drug_Name`, `Sponsor_Name`, `Primary_IDs`, `Study_Type`, `Trial_Start_Date`, `Trial_End_Date`, `Study_Design`, `Total_Count` FROM `cognito-prod-394707.cognito_prod_datamart.vw_clinical_trials_GD` 
+WHERE lower(Cleaned_Drug_Name) = 'cagrilintide+semaglutide'
