@@ -825,7 +825,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[Step 8b] Drug       : {args.drug}")
-    print(f"[Step 8b] Model      : {MODEL}")
+    print(f"[Step 8b] Model      : {get_model_name()}")
     print(f"[Step 8b] ChromaDB   : {CHROMA_DB_PATH}")
     print(f"[Step 8b] Cache      : {ANALYSIS_CACHE_DIR}")
     print(f"[Step 8b] Output     : {output_dir.resolve()}")
