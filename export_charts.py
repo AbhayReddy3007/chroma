@@ -22,23 +22,21 @@ import json
 import os
 import re
 import sys
-import traceback
 from pathlib import Path
 from typing import Optional
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-# ─────────────────────────────────────────────────────────────
-# Hardcoded path to the BigQuery service-account JSON key.
-# Update this if the file moves.
-# ─────────────────────────────────────────────────────────────
-SERVICE_ACCOUNT_JSON = r"C:\Users\P90022569\Downloads\service 2.json"
+# Load .env if present (python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-STEP9_OUTPUT_DIR = SCRIPT_DIR / "step9_output"
+STEP9_OUTPUT_DIR = Path(__file__).parent / "step9_output"
 BQ_TABLE         = os.getenv("BQ_PATENT_TABLE",
                              "prj-portfolio-ai-dev.portfolio_data.patent_discovery")
 
@@ -52,40 +50,6 @@ def _strip_underscores(patent_number: str) -> str:
     return patent_number.replace("_", "")
 
 
-def _make_bq_client():
-    """
-    Build a BigQuery client the same way as the known-working reference
-    snippet: point GOOGLE_APPLICATION_CREDENTIALS at the hardcoded
-    service-account JSON key, then let bigquery.Client() pick it up
-    itself — no manual Credentials object.
-
-    Returns (client, error_message). If client is None, error_message
-    explains exactly why.
-    """
-    try:
-        from google.cloud import bigquery
-    except ImportError:
-        return None, ("google-cloud-bigquery is not installed. "
-                       "Run: pip install google-cloud-bigquery")
-
-    candidate = Path(SERVICE_ACCOUNT_JSON)
-    if not candidate.exists():
-        return None, (f"SERVICE_ACCOUNT_JSON is set to '{SERVICE_ACCOUNT_JSON}' "
-                       f"but no file exists there.")
-
-    # Same pattern as the working script: set the env var BigQuery's
-    # client libraries look for, then construct the client with no args.
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(candidate)
-
-    try:
-        client = bigquery.Client()
-        print(f"[BQ] Authenticated via GOOGLE_APPLICATION_CREDENTIALS: {candidate} "
-              f"(project={client.project})")
-        return client, None
-    except Exception as e:
-        return None, f"bigquery.Client() failed with '{candidate}' set: {e}"
-
-
 def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     """
     Query BigQuery for all patent numbers in one batched call.
@@ -97,12 +61,29 @@ def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     if not patent_numbers:
         return {}
 
-    client, err = _make_bq_client()
-    if client is None:
-        print(f"[BQ] Could not create BigQuery client: {err}")
-        print("[BQ] Filed By will show 'Unknown' for all patents. "
-              "Use --no_bq to skip this step silently next time.")
-        return {p: "Unknown" for p in patent_numbers}
+    try:
+        from google.cloud import bigquery
+    except ImportError:
+        print("[BQ] google-cloud-bigquery not installed — Filed By will be blank.")
+        return {}
+
+    try:
+        sa_path = os.getenv("GCS_SERVICE_ACCOUNT")
+        if sa_path:
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_file(
+                sa_path,
+                scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+            )
+            client = bigquery.Client(credentials=credentials,
+                                     project=credentials.project_id)
+            print(f"[BQ] Authenticated via GCS_SERVICE_ACCOUNT: {sa_path}")
+        else:
+            client = bigquery.Client()
+            print("[BQ] GCS_SERVICE_ACCOUNT not set — using application default credentials")
+    except Exception as e:
+        print(f"[BQ] Could not create BigQuery client: {e} — Filed By will be blank.")
+        return {}
 
     # Build two sets: original and stripped variants
     originals = list(dict.fromkeys(patent_numbers))   # deduplicated, order preserved
@@ -122,10 +103,8 @@ def fetch_assignees(patent_numbers: list[str]) -> dict[str, str]:
     try:
         rows = list(client.query(query).result())
     except Exception as e:
-        print(f"[BQ] Query failed: {e}")
-        traceback.print_exc()
-        print("[BQ] Filed By will show 'Unknown' for all patents.")
-        return {p: "Unknown" for p in patent_numbers}
+        print(f"[BQ] Query failed: {e} — Filed By will be blank.")
+        return {}
 
     # Index results: patent_number → best assignee value
     bq_index: dict[str, str] = {}
@@ -199,15 +178,13 @@ def build_excel(
     wb.remove(wb.active)
 
     # ── Sheet 1: Claim Charts ─────────────────────────────────
-    # Columns: Patent No. | Filed By | Claim | Ground | Basis |
-    #          Limitation (verbatim) | Limitation ID |
-    #          Prior Art Passage(s) | Reference(s) | Locus / Citation
     ws1 = wb.create_sheet("Claim Charts")
-    _col_widths(ws1, [14, 30, 8, 10, 8, 60, 14, 80, 35, 40])
+    _col_widths(ws1, [14, 30, 8, 10, 8, 60, 14, 80, 35, 40, 40, 15, 12, 45])
     r = _header_row(ws1, [
         "Patent No.", "Filed By", "Claim", "Ground", "Basis",
         "Limitation (verbatim)", "Limitation ID",
         "Prior Art Passage(s)", "Reference(s)", "Locus / Citation",
+        "Citation URL", "Pub Date", "Confidence", "Confidence Rationale",
     ], 1)
 
     for chart_data in all_charts:
@@ -218,8 +195,8 @@ def build_excel(
             ground_id = chart["ground_id"]
             basis     = chart["basis"]
 
-            # Ground header row (span all 10 columns)
-            ws1.merge_cells(start_row=r, start_column=1, end_row=r, end_column=10)
+            # Ground header row (span all 14 columns)
+            ws1.merge_cells(start_row=r, start_column=1, end_row=r, end_column=14)
             c = ws1.cell(row=r, column=1, value=chart.get("basis_line", ""))
             c.font      = Font(name="Arial", bold=True, size=10)
             c.alignment = Alignment(wrap_text=True, vertical="center")
@@ -232,6 +209,7 @@ def build_excel(
                 ltext = row_data.get("limitation_text", "")
 
                 passages_parts, ref_parts, locus_parts = [], [], []
+                url_parts, date_parts, conf_parts, conf_rat_parts = [], [], [], []
                 for cd in row_data.get("cells", []):
                     ref_id = cd.get("reference_id", "")
                     for p in cd.get("passages", []):
@@ -242,10 +220,19 @@ def build_excel(
                             passages_parts.append(f'{label}"{passage}"')
                             ref_parts.append(ref_id)
                             locus_parts.append(f"{ref_id} at {locus}" if locus else ref_id)
+                            url_parts.append(p.get("citation_url", ""))
+                            date_parts.append(p.get("publication_date", ""))
+                            cs = p.get("confidence_score", "")
+                            conf_parts.append(str(cs) if cs != "" else "")
+                            conf_rat_parts.append(p.get("confidence_rationale", ""))
 
                 passage_text = "\n\n".join(passages_parts) or "Not disclosed — see Gap List"
                 ref_text     = "; ".join(dict.fromkeys(ref_parts)) or "—"
                 locus_text   = "\n".join(locus_parts) or "—"
+                url_text     = "\n".join(u for u in url_parts if u) or "—"
+                date_text    = "\n".join(d for d in date_parts if d) or "—"
+                conf_text    = "\n".join(c for c in conf_parts if c) or "—"
+                conf_rat_text = "\n".join(c for c in conf_rat_parts if c) or "—"
 
                 _cell(ws1, r, 1,  patent)
                 _cell(ws1, r, 2,  fb)
@@ -257,6 +244,10 @@ def build_excel(
                 _cell(ws1, r, 8,  passage_text)
                 _cell(ws1, r, 9,  ref_text)
                 _cell(ws1, r, 10, locus_text)
+                _cell(ws1, r, 11, url_text)
+                _cell(ws1, r, 12, date_text)
+                _cell(ws1, r, 13, conf_text)
+                _cell(ws1, r, 14, conf_rat_text)
                 ws1.row_dimensions[r].height = max(40, min(120, 15 * (passage_text.count("\n") + 2)))
                 r += 1
 
@@ -292,10 +283,10 @@ def build_excel(
 
     # ── Sheet 3: Reference List ───────────────────────────────
     ws3 = wb.create_sheet("Reference List")
-    _col_widths(ws3, [14, 30, 25, 60, 15, 14, 25])
+    _col_widths(ws3, [14, 30, 25, 60, 15, 14, 25, 50])
     r = _header_row(ws3, [
         "Patent No.", "Filed By", "Short Name", "Full Citation",
-        "Publication Date", "Pre-Priority?", "Access",
+        "Publication Date", "Pre-Priority?", "Access", "Citation URL",
     ], 1)
 
     for chart_data in all_charts:
@@ -309,6 +300,7 @@ def build_excel(
             _cell(ws3, r, 5, ref.get("publication_date", ""))
             _cell(ws3, r, 6, "Yes" if ref.get("pre_priority") else "No")
             _cell(ws3, r, 7, ref.get("access", "publicly accessible"))
+            _cell(ws3, r, 8, ref.get("citation_url", ""))
             ws3.row_dimensions[r].height = 25
             r += 1
 
