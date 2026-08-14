@@ -1,14 +1,17 @@
-SELECT DISTINCT cleaned_generic_name
-FROM `{PROJECT_ID}.{DATASET_ID}.vw_drug_details_full`
-WHERE
-(
-    UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE 1%'
-    OR UPPER(cleaned_Target) LIKE '%GLP-1%'
-    OR UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE-1%'
-    OR (
-        data_source = 'IPD'
-        AND Mechanism_of_Action = 'Glucagon-like peptide-1 (GLP-1) agonist'
-    )
-)
-AND Mechanism_of_Action IS NOT NULL
-AND LOWER(Mechanism_of_Action) NOT LIKE '%antagonist%'
+(cognito) C:\Users\P90022569\Downloads\indexing\indexing\chroma_main>python step9.py --drug Axitinib
+Traceback (most recent call last):
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 37, in <module>
+    from .llm_client import get_model_name
+ImportError: attempted relative import with no known parent package
+
+(cognito) C:\Users\P90022569\Downloads\indexing\indexing\chroma_main>python step9.py --drug Axitinib
+Traceback (most recent call last):
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 37, in <module>
+    from .llm_client import get_model_name
+ImportError: attempted relative import with no known parent package
+
+(cognito) C:\Users\P90022569\Downloads\indexing\indexing\chroma_main>python step9.py --drug Axitinib
+Traceback (most recent call last):
+  File "C:\Users\P90022569\Downloads\indexing\indexing\chroma_main\step9.py", line 37, in <module>
+    from .llm_client import get_model_name
+ImportError: attempted relative import with no known parent package
