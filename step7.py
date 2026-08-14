@@ -32,8 +32,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from .llm_client import generate, parse_json_response, get_model_name, is_claude, is_gemini
 
 # ─────────────────────────────────────────────────────────────
 # Paths — must match step6.py and indexer.py
@@ -45,24 +44,10 @@ STEP7_OUTPUT_DIR = Path(os.getenv("STEP7_OUTPUT_DIR", Path(__file__).parent / "s
 CHROMA_DB_PATH   = str(Path(__file__).parent / "chroma_patent_db")
 
 # ─────────────────────────────────────────────────────────────
-# Gemini client
+# Worker count (shared across steps 7-9)
 # ─────────────────────────────────────────────────────────────
 
-MODEL          = "gemini-2.5-flash-preview-05-20"
-_gemini_client = None
-_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))  # shared across steps 7-9
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is not set.\n"
-                "Add it to your .env file or set it in your shell before running."
-            )
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+_WORKERS = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB — lazy init so import doesn't crash if chromadb absent
@@ -394,29 +379,29 @@ async def decompose_patent(item: dict) -> Optional[dict]:
         text_source       = text_source,
     )
 
-    # ── Call Gemini — always with Google Search grounding ─────
-    config = types.GenerateContentConfig(
-        tools       = [types.Tool(google_search=types.GoogleSearch())],
-        temperature = 0.0,
-    )
-
+    # ── Call LLM — with web search for both Gemini and Claude ─
     try:
-        response = await _get_gemini_client().aio.models.generate_content(
-            model    = MODEL,
-            contents = prompt,
-            config   = config,
+        raw = await generate(
+            prompt         = prompt,
+            use_web_search = True,
+            temperature    = 0.0,
+            max_output_tokens = 65536,
         )
-
-        raw = (response.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
-        raw = raw.strip()
 
         if not raw:
             print(f"[Step 7] Empty response for {patent_number}")
             return None
 
-        result = json.loads(raw)
+        result = parse_json_response(raw)
+        if result is None:
+            print(f"[Step 7] JSON parse error for {patent_number}")
+            print(f"         Raw (first 500): {raw[:500]}")
+            return None
+
+        if isinstance(result, list):
+            result = result[0] if result else None
+        if result is None:
+            return None
 
         if "error" in result:
             print(f"[Step 7] ⚠  {result['error']}")
@@ -433,15 +418,11 @@ async def decompose_patent(item: dict) -> Optional[dict]:
         )
         src = result.get("text_source", text_source)
         print(f"[Step 7] ✓ {patent_number} — {n_claims} independent claim(s), "
-              f"{n_lims} limitation(s) | source: {src}")
+              f"{n_lims} limitation(s) | source: {src} | model: {get_model_name()}")
         return result
 
-    except json.JSONDecodeError as e:
-        print(f"[Step 7] JSON parse error for {patent_number}: {e}")
-        print(f"         Raw (first 500): {raw[:500]}")
-        return None
     except Exception as e:
-        print(f"[Step 7] Gemini error for {patent_number}: {e}")
+        print(f"[Step 7] LLM error for {patent_number}: {e}")
         return None
 
 
@@ -626,7 +607,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[Step 7] Drug        : {args.drug}")
-    print(f"[Step 7] Model       : {MODEL}")
+    print(f"[Step 7] Model       : {get_model_name()}")
     print(f"[Step 7] ChromaDB    : {CHROMA_DB_PATH}")
     print(f"[Step 7] Patent      : {args.patent or 'all in queue'}")
     print(f"[Step 7] Priority    : {args.priority or 'all'}")
