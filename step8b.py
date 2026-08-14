@@ -37,8 +37,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from .llm_client import generate, parse_json_response, get_model_name, is_claude, is_gemini
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -54,21 +53,7 @@ ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent 
 # Gemini
 # ─────────────────────────────────────────────────────────────
 
-MODEL          = "gemini-2.5-flash-preview-05-20"
-_gemini_client = None
 _WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is not set.\n"
-                "Add it to your .env file or set it in your shell before running."
-            )
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB + analysis cache helpers
@@ -532,39 +517,33 @@ async def _llm_refine_grounds(
         gaps_json     = json.dumps(det_grounds["gap_limitations"], indent=2),
     )
 
-    print(f"[Step 8b LLM] Optimising grounds for {patent_number} Claim {claim_number}...")
+    print(f"[Step 8b LLM] Optimising grounds for {patent_number} Claim {claim_number} "
+          f"| model: {get_model_name()}...")
 
     try:
-        response = await _get_gemini_client().aio.models.generate_content(
-            model   = MODEL,
-            contents = prompt,
-            config  = types.GenerateContentConfig(
-                tools       = [types.Tool(google_search=types.GoogleSearch())],
-                temperature = 0.1,
-            ),
+        raw = await generate(
+            prompt         = prompt,
+            use_web_search = True,
+            temperature    = 0.1,
+            max_output_tokens = 65536,
         )
-
-        raw = (response.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
-        raw = raw.strip()
 
         if not raw:
             print(f"[Step 8b LLM] Empty response for claim {claim_number}")
             return None
 
-        result = json.loads(raw)
+        result = parse_json_response(raw)
+        if result is None:
+            print(f"[Step 8b LLM] JSON parse failed for claim {claim_number}")
+            return None
+
         print(f"[Step 8b LLM] ✓ Claim {claim_number}: "
               f"{len(result.get('alternative_103_grounds', []))} alternative(s), "
               f"{len(result.get('strength_ranking', []))} ranked ground(s)")
         return result
 
-    except json.JSONDecodeError as e:
-        print(f"[Step 8b LLM] JSON parse error: {e}")
-        print(f"              Raw (first 500): {raw[:500]}")
-        return None
     except Exception as e:
-        print(f"[Step 8b LLM] Gemini error: {e}")
+        print(f"[Step 8b LLM] LLM error: {e}")
         return None
 
 
