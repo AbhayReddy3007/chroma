@@ -34,8 +34,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from .llm_client import get_model_name
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -54,22 +53,7 @@ ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR", Path(__file__).parent 
 #  hints only — but step8b bootstrapping may need it)
 # ─────────────────────────────────────────────────────────────
 
-MODEL          = "gemini-2.5-flash-preview-05-20"
-_gemini_client = None
-_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.\n"
-                "Step 9 itself makes no Gemini calls, but upstream steps (7, 8a, 8b) do.\n"
-                "Set it in your .env or environment before running."
-            )
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+_WORKERS = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB + analysis cache (reuse helpers)
@@ -196,6 +180,7 @@ def _assemble_charts(
                     "publication_date": ev.get("publication_date", "?"),
                     "pre_priority":     ev.get("pre_priority", False),
                     "access":           "publicly accessible",
+                    "citation_url":     ev.get("citation_url", ""),
                 }
 
     charts:           list = []
@@ -263,8 +248,13 @@ def _assemble_charts(
                                 locus   = ev.get("locus", "")
                                 if passage:
                                     passages.append({
-                                        "passage_verbatim": passage,
-                                        "locus":            locus,
+                                        "passage_verbatim":     passage,
+                                        "locus":                locus,
+                                        "citation_url":         ev.get("citation_url", ""),
+                                        "publication_date":     ev.get("publication_date", ""),
+                                        "confidence_score":     ev.get("confidence_score", ""),
+                                        "confidence_rationale": ev.get("confidence_rationale", ""),
+                                        "reads_on_rationale":   ev.get("reads_on_rationale", ""),
                                     })
                         if passages:
                             cells.append({
@@ -276,7 +266,11 @@ def _assemble_charts(
                     cells.append({
                         "reference_id": "—",
                         "passages":     [{"passage_verbatim": "Not disclosed — see Gap List",
-                                          "locus": ""}],
+                                          "locus": "", "citation_url": "",
+                                          "publication_date": "",
+                                          "confidence_score": "",
+                                          "confidence_rationale": "",
+                                          "reads_on_rationale": ""}],
                     })
 
                 rows.append({
