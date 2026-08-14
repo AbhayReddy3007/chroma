@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .llm_client import get_model_name
+from llm_client import get_model_name
 
 # ─────────────────────────────────────────────────────────────
 # Paths
