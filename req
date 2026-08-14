@@ -1,2 +1,14 @@
-SELECT `Trial_Title`, `Trial_Status`, `Trial_Phase`, `Cleaned_Drug_Name`, `Sponsor_Name`, `Primary_IDs`, `Study_Type`, `Trial_Start_Date`, `Trial_End_Date`, `Study_Design`, `Total_Count` FROM `cognito-prod-394707.cognito_prod_datamart.vw_clinical_trials_GD` 
-WHERE lower(Cleaned_Drug_Name) = 'cagrilintide+semaglutide'
+SELECT DISTINCT cleaned_generic_name
+FROM `{PROJECT_ID}.{DATASET_ID}.vw_drug_details_full`
+WHERE
+(
+    UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE 1%'
+    OR UPPER(cleaned_Target) LIKE '%GLP-1%'
+    OR UPPER(cleaned_Target) LIKE '%GLUCAGON LIKE PEPTIDE-1%'
+    OR (
+        data_source = 'IPD'
+        AND Mechanism_of_Action = 'Glucagon-like peptide-1 (GLP-1) agonist'
+    )
+)
+AND Mechanism_of_Action IS NOT NULL
+AND LOWER(Mechanism_of_Action) NOT LIKE '%antagonist%'
