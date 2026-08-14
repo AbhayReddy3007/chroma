@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .llm_client import generate, parse_json_response, get_model_name, is_claude, is_gemini
+from llm_client import generate, parse_json_response, get_model_name, is_claude, is_gemini
 
 # ─────────────────────────────────────────────────────────────
 # Paths — must match step6.py and indexer.py
