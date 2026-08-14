@@ -30,8 +30,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from .llm_client import generate, parse_json_response, get_model_name, is_claude, is_gemini
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -42,25 +41,7 @@ STEP8A_OUTPUT_DIR  = Path(os.getenv("STEP8A_OUTPUT_DIR",    Path(__file__).paren
 CHROMA_DB_PATH     = str(Path(__file__).parent / "chroma_patent_db")
 ANALYSIS_CACHE_DIR = Path(os.getenv("ANALYSIS_CACHE_DIR",   Path(__file__).parent / "analysis_cache"))
 
-# ─────────────────────────────────────────────────────────────
-# Gemini
-# ─────────────────────────────────────────────────────────────
-
-MODEL          = "gemini-2.5-flash-preview-05-20"
-_gemini_client = None
-_WORKERS       = int(os.getenv("PIPELINE_WORKERS", "6"))
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is not set.\n"
-                "Add it to your .env file or set it in your shell before running."
-            )
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+_WORKERS = int(os.getenv("PIPELINE_WORKERS", "6"))
 
 # ─────────────────────────────────────────────────────────────
 # ChromaDB — lazy init
@@ -222,13 +203,16 @@ _SOURCE_ROUTES = {
 
 
 # ─────────────────────────────────────────────────────────────
-# Gemini prompt — ONE limitation per call to avoid truncation
+# Prompt — ONE limitation per call, multiple prior arts each
 # ─────────────────────────────────────────────────────────────
 
 _PRIOR_ART_PROMPT = """\
 You are an invalidity prior-art hunter for patent claim charting.
 You find published disclosures dated STRICTLY BEFORE the priority date
 that READ ON the ONE limitation below — cited to the exact passage.
+
+Find ALL qualifying references for this limitation — do NOT limit to just one.
+Return EVERY reference that reads on this limitation.
 
 PATENT CONTEXT
 ==============
@@ -252,7 +236,7 @@ GLOBAL RULES
 =============
 1. DATE BOUND (hard): a reference qualifies ONLY if its public disclosure date
    is STRICTLY BEFORE {priority_date}. Anything within the 12 months before
-   {priority_date} → GRACE bucket: flag "GRACE_PERIOD - admissibility
+   {priority_date} -> GRACE bucket: flag "GRACE_PERIOD - admissibility
    case-by-case; counsel to confirm".
 2. READ-ON TEST: the passage must disclose the limitation's SPECIFIC feature,
    not merely the same topic. Reject topical-only matches.
@@ -261,27 +245,29 @@ GLOBAL RULES
    - ClinicalTrials.gov: NCT id + section
    - Google Patents: patent number + column:line or claim/paragraph
    - medRxiv     : DOI + section
-   No locus → do not include.
-4. If only a pharmacopoeia/handbook/supplier disclosure would read on an
-   excipient/concentration/pH limitation, flag "OUT_OF_CORPUS - paid/CAS/
-   pharmacopoeia source required".
-5. Budget: MAX 8 query reformulations. Use structural, functional AND
-   terminological variants. Widen to adjacent sources if needed.
-6. Never fabricate PMIDs, NCT ids, patent numbers, or DOIs. If unsure, omit.
-7. Prefer the fewest strong references.
+   No locus -> do not include.
+4. CITATION URL: for every reference, include the full URL where the document
+   can be accessed (e.g. https://patents.google.com/patent/US6123456,
+   https://pubmed.ncbi.nlm.nih.gov/12345678/).
+5. If only a pharmacopoeia/handbook/supplier disclosure would read on an
+   excipient/concentration/pH limitation, flag "OUT_OF_CORPUS".
+6. Budget: MAX 8 query reformulations. Use structural, functional AND
+   terminological variants.
+7. Never fabricate PMIDs, NCT ids, patent numbers, DOIs, or URLs.
+8. Return MULTIPLE references where available — do not stop at the first hit.
 
 OUTPUT FORMAT
 =============
 Return ONLY a single valid JSON object — no markdown fences, no prose.
 
-{{
+{{{{
   "patent_number": "{patent_number}",
   "priority_date": "{priority_date}",
   "claim_number": {claim_number},
   "limitation_id": "{limitation_id}",
   "limitation_text_verbatim": "{limitation_text_escaped}",
   "evidence": [
-    {{
+    {{{{
       "reference_id": "Author_PatentNo_Year",
       "source": "Google Patents",
       "publication_date": "YYYY-MM-DD",
@@ -289,44 +275,31 @@ Return ONLY a single valid JSON object — no markdown fences, no prose.
       "grace_flag": false,
       "locus": "Col. 4, lines 22-35",
       "passage_verbatim": "exact text from source...",
+      "citation_url": "https://patents.google.com/patent/US6123456",
       "reads_on_rationale": "Discloses the identical feature because...",
-      "confidence": "high"
-    }}
+      "confidence_score": 0.92,
+      "confidence_rationale": "Exact compound structure match with identical parameters"
+    }}}}
   ],
   "limitation_status": "covered",
   "flags": []
-}}
+}}}}
+
+confidence_score: 0.0 to 1.0 where:
+  0.9-1.0 = exact feature match, verbatim or near-verbatim disclosure
+  0.7-0.89 = strong read-on, same feature with minor differences
+  0.5-0.69 = moderate, partial overlap requiring interpretation
+  below 0.5 = weak, topical only — do NOT include
+
+confidence_rationale: one sentence explaining WHY the confidence is at that level.
 
 If NO qualifying art exists: set limitation_status="uncovered", evidence=[],
-and add a flag explaining the gap (e.g. "OUT_OF_CORPUS", "NO_QUALIFYING_ART").
+and add a flag explaining the gap.
 """
 
 
-def _try_repair_json(raw: str) -> Optional[dict]:
-    """
-    Attempt to recover a truncated JSON object by closing open structures.
-    Only used as a last resort when json.loads fails.
-    """
-    s = raw.strip()
-
-    # Close any open string
-    quote_count = s.count('"') - s.count('\\"')
-    if quote_count % 2 != 0:
-        s += '"'
-
-    # Close open arrays/objects by counting brackets
-    opens = s.count('[') - s.count(']')
-    closes = s.count('{') - s.count('}')
-    s += ']' * opens + '}' * closes
-
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        return None
-
-
 # ─────────────────────────────────────────────────────────────
-# Core per-claim processor — one Gemini call per limitation
+# Core per-limitation processor — one LLM call per limitation
 # ─────────────────────────────────────────────────────────────
 
 async def _search_one_limitation(
@@ -338,7 +311,7 @@ async def _search_one_limitation(
     lim:            dict,
     context_block:  str,
 ) -> Optional[dict]:
-    """One Gemini call for one limitation. Returns the result dict or None."""
+    """One LLM call for one limitation. Returns the result dict or None."""
     lid   = lim.get("limitation_id", "?")
     ltext = lim.get("limitation_text_verbatim", "")
     ltype = lim.get("limitation_type", "unknown")
@@ -346,8 +319,6 @@ async def _search_one_limitation(
 
     sources    = ", ".join(_SOURCE_ROUTES.get(ltype, ["Google Patents", "PubMed"]))
     flags_block = f"Flags: {', '.join(flags)}" if flags else ""
-
-    # Escape limitation text for JSON template (only double-quotes matter)
     ltext_escaped = ltext.replace('"', '\\"')
 
     prompt = _PRIOR_ART_PROMPT.format(
@@ -366,58 +337,43 @@ async def _search_one_limitation(
     )
 
     try:
-        response = await _get_gemini_client().aio.models.generate_content(
-            model    = MODEL,
-            contents = prompt,
-            config   = types.GenerateContentConfig(
-                tools            = [types.Tool(google_search=types.GoogleSearch())],
-                temperature      = 0.0,
-                max_output_tokens= 65536,
-            ),
+        raw = await generate(
+            prompt         = prompt,
+            use_web_search = True,
+            temperature    = 0.0,
+            max_output_tokens = 65536,
         )
-
-        raw = (response.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
-        raw = raw.strip()
 
         if not raw:
             print(f"[Step 8a]   {lid}: empty response")
             return None
 
-        # Primary parse
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as e:
-            print(f"[Step 8a]   {lid}: JSON parse error ({e}) — attempting repair...")
-            result = _try_repair_json(raw)
-            if result is None:
-                print(f"[Step 8a]   {lid}: repair failed — limitation marked uncovered")
-                return {
-                    "patent_number":          patent_number,
-                    "priority_date":          priority_date,
-                    "claim_number":           claim_number,
-                    "limitation_id":          lid,
-                    "limitation_text_verbatim": ltext,
-                    "evidence":               [],
-                    "limitation_status":      "uncovered",
-                    "flags":                  ["PARSE_ERROR - Gemini response truncated; manual search required"],
-                }
-            print(f"[Step 8a]   {lid}: JSON repaired successfully")
+        result = parse_json_response(raw)
+        if result is None:
+            print(f"[Step 8a]   {lid}: JSON parse failed — marked uncovered")
+            return {
+                "patent_number":            patent_number,
+                "priority_date":            priority_date,
+                "claim_number":             claim_number,
+                "limitation_id":            lid,
+                "limitation_text_verbatim": ltext,
+                "evidence":                 [],
+                "limitation_status":        "uncovered",
+                "flags":                    ["PARSE_ERROR - LLM response truncated"],
+            }
 
-        # Normalise: some models return a list with one item
         if isinstance(result, list):
             result = result[0] if result else None
 
         if result:
             status = result.get("limitation_status", "?")
             n_ev   = len(result.get("evidence", []))
-            print(f"[Step 8a]   {lid}: {status} ({n_ev} evidence item(s))")
+            print(f"[Step 8a]   {lid}: {status} ({n_ev} evidence) | model: {get_model_name()}")
 
         return result
 
     except Exception as e:
-        print(f"[Step 8a]   {lid}: Gemini error — {e}")
+        print(f"[Step 8a]   {lid}: LLM error — {e}")
         return None
 
 
@@ -692,7 +648,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[Step 8a] Drug       : {args.drug}")
-    print(f"[Step 8a] Model      : {MODEL}")
+    print(f"[Step 8a] Model      : {get_model_name()}")
     print(f"[Step 8a] ChromaDB   : {CHROMA_DB_PATH}")
     print(f"[Step 8a] Cache      : {ANALYSIS_CACHE_DIR}")
     print(f"[Step 8a] Output     : {output_dir.resolve()}")
