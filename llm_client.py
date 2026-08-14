@@ -80,8 +80,10 @@ _claude_client = None
 
 def _get_claude_client():
     """
-    Initialise the Anthropic client using the GCS_SERVICE_ACCOUNT
-    service account JSON file via Vertex AI.
+    Initialise the Anthropic Vertex client using the GCS_SERVICE_ACCOUNT
+    service account JSON file. Sets GOOGLE_APPLICATION_CREDENTIALS so the
+    google-auth library picks it up as Application Default Credentials —
+    this is the method AnthropicVertex officially supports.
     """
     global _claude_client
     if _claude_client is None:
@@ -101,22 +103,21 @@ def _get_claude_client():
                 "Check GCS_SERVICE_ACCOUNT in your .env."
             )
 
-        # Load credentials from service account JSON
-        from google.oauth2 import service_account
-        credentials = service_account.Credentials.from_service_account_file(
-            sa_path,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
+        # Set as Application Default Credentials — AnthropicVertex uses ADC internally
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
 
-        project_id = credentials.project_id or os.getenv("BQ_PROJECT_ID", "")
+        # Read project_id from the JSON file
+        import json as _json
+        with open(sa_path) as f:
+            sa_data = _json.load(f)
+        project_id = sa_data.get("project_id") or os.getenv("BQ_PROJECT_ID", "")
         region     = os.getenv("VERTEX_AI_REGION", "us-east5")
 
         _claude_client = anthropic.AnthropicVertex(
             project_id = project_id,
             region     = region,
-            credentials = credentials,
         )
-        print(f"[LLM] Claude client via Vertex AI | project: {project_id} | region: {region}")
+        print(f"[LLM] Claude via Vertex AI | project: {project_id} | region: {region} | sa: {sa_path}")
 
     return _claude_client
 
