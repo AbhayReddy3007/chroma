@@ -237,22 +237,38 @@ Sources to search: {sources}
 
 SEARCH STRATEGY (follow this order for each source)
 ====================================================
-For EACH source listed above, run at least 2 queries combining:
+For EACH source listed above, run at least 3 queries:
   Query A: "{drug_name}" + key technical terms from the limitation text
   Query B: drug synonyms / INN / brand names + limitation feature
-  Query C: structural/functional variants of the limitation feature alone
-  Query D: examiner-cited art on the Google Patents page for {patent_number}
+  Query C: "{patent_number}" on Google Patents → open the patent page →
+           read the "Cited by" and "References cited" sections →
+           check EACH cited/citing document for this limitation's feature.
+           These are the highest-quality prior art sources.
+  Query D: "{drug_name}" + "{patent_number}" + limitation feature terms
+  Query E: structural/functional/terminological variants of the limitation alone
 
-Using the drug name in searches dramatically improves recall — the prior art
-almost always discloses the same drug (or a structural analogue) with the
-same formulation/method feature. Always include the drug name as a search term.
+IMPORTANT: The patent's own citations (found via Query C on Google Patents)
+are the most productive search path. Examiners and inventors have already
+identified the closest prior art — start there.
+
+HARD DATE REJECTION RULE
+=========================
+You MUST check the publication date of EVERY reference BEFORE including it.
+If the publication date is ON or AFTER {priority_date}: DO NOT INCLUDE IT.
+There are ZERO exceptions. A reference published after the priority date is
+NOT prior art and must never appear in the evidence array.
+
+If you are uncertain about a reference's date, DO NOT INCLUDE IT.
+
+A reference within 12 months BEFORE {priority_date} → include it BUT
+flag "GRACE_PERIOD - admissibility case-by-case; counsel to confirm"
+and set grace_flag: true.
 
 GLOBAL RULES
 =============
-1. DATE BOUND (hard): a reference qualifies ONLY if its public disclosure date
-   is STRICTLY BEFORE {priority_date}. Anything within the 12 months before
-   {priority_date} -> GRACE bucket: flag "GRACE_PERIOD - admissibility
-   case-by-case; counsel to confirm".
+1. DATE BOUND (ABSOLUTE): Any reference with publication_date >= {priority_date}
+   is INVALID prior art and MUST NOT appear in the evidence array.
+   Check every reference's date. No exceptions. If date is unknown, exclude it.
 2. READ-ON TEST: the passage must disclose the limitation's SPECIFIC feature,
    not merely the same topic. Reject topical-only matches.
 3. ANCHORING: every passage MUST carry a pinpoint locus:
