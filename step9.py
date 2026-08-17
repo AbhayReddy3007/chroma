@@ -142,7 +142,7 @@ async def _ensure_step8b(drug_name: str, force: bool = False) -> None:
         mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         run_for_drug = mod.run_for_drug
-    await run_for_drug(drug_name=drug_name)
+    await run_for_drug(drug_name=drug_name, rerun_step8a=force)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -922,21 +922,48 @@ async def run_for_drug(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Step 9 – Invalidity Claim Chart Assembler (final deliverable)"
+        description=(
+            "Full invalidity pipeline: Step 6 → 7 → 8a → 8b → 9\n"
+            "Runs all steps for a drug. Each step skips already-completed work\n"
+            "unless --rerun_all is passed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--drug",       "-d", required=True)
-    parser.add_argument("--patent",     "-p", default=None)
+    parser.add_argument("--drug",   "-d", required=True,
+                        help="Drug name (e.g. Axitinib)")
+    parser.add_argument("--model",  "-m", default=None,
+                        help=(
+                            "LLM model to use. Overrides LLM_MODEL in .env.\n"
+                            "Options: gemini-2.5-flash-preview-05-20, "
+                            "gemini-3.1-pro-preview, gemini-3.1-pro, claude-sonnet-4-6"
+                        ))
+    parser.add_argument("--patent",     "-p", default=None,
+                        help="Process only this patent number (optional)")
     parser.add_argument("--rerun_all",  action="store_true",
-                        help="Cascade re-run steps 7 → 8a → 8b → 9")
+                        help="Re-run all steps even if output already exists")
     parser.add_argument("--output_dir", default=str(STEP9_OUTPUT_DIR))
     args = parser.parse_args()
+
+    # ── Set model BEFORE importing llm_client ─────────────────
+    # llm_client reads LLM_MODEL at import time, so set env var first
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model.strip()
+
+    # Re-import get_model_name after env var is set so it reflects the arg
+    from llm_client import get_model_name
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[Step 9] Drug       : {args.drug}")
-    print(f"[Step 9] Patent     : {args.patent or 'all'}")
-    print(f"[Step 9] Output     : {output_dir.resolve()}")
+    print("=" * 65)
+    print(f"  IP Invalidity Pipeline — Steps 6 → 7 → 8a → 8b → 9")
+    print("=" * 65)
+    print(f"  Drug       : {args.drug}")
+    print(f"  Model      : {get_model_name()}")
+    print(f"  Patent     : {args.patent or 'all in charting queue'}")
+    print(f"  Rerun all  : {args.rerun_all}")
+    print(f"  Output dir : {output_dir.resolve()}")
+    print("=" * 65)
 
     results = asyncio.run(run_for_drug(
         drug_name     = args.drug,
@@ -947,7 +974,7 @@ def main() -> None:
 
     total_charts = sum(len(r.get("charts", [])) for r in results)
     total_gaps   = sum(len(r.get("gap_list", [])) for r in results)
-    print(f"\n[Step 9] Done. {total_charts} chart(s) rendered, {total_gaps} gap(s) remaining.")
+    print(f"\n[Pipeline] Done. {total_charts} chart(s) rendered, {total_gaps} gap(s) remaining.")
 
     if not results:
         sys.exit(1)
