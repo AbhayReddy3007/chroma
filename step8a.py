@@ -211,8 +211,10 @@ You are an invalidity prior-art hunter for patent claim charting.
 You find published disclosures dated STRICTLY BEFORE the priority date
 that READ ON the ONE limitation below — cited to the exact passage.
 
-Find ALL qualifying references for this limitation — do NOT limit to just one.
-Return EVERY reference that reads on this limitation.
+CRITICAL REQUIREMENT: You MUST search ALL routed sources and return EVERY
+qualifying reference found. Do NOT return just one reference and stop.
+The evidence array must contain ALL references that read on this limitation.
+Target at minimum 3 references. There is no upper limit.
 
 PATENT CONTEXT
 ==============
@@ -229,8 +231,21 @@ LIMITATION TO SEARCH
 ID   : {limitation_id}
 Type : {limitation_type}
 Text : {limitation_text}
+Drug : {drug_name}
 {flags_block}
 Sources to search: {sources}
+
+SEARCH STRATEGY (follow this order for each source)
+====================================================
+For EACH source listed above, run at least 2 queries combining:
+  Query A: "{drug_name}" + key technical terms from the limitation text
+  Query B: drug synonyms / INN / brand names + limitation feature
+  Query C: structural/functional variants of the limitation feature alone
+  Query D: examiner-cited art on the Google Patents page for {patent_number}
+
+Using the drug name in searches dramatically improves recall — the prior art
+almost always discloses the same drug (or a structural analogue) with the
+same formulation/method feature. Always include the drug name as a search term.
 
 GLOBAL RULES
 =============
@@ -254,36 +269,70 @@ GLOBAL RULES
 6. Budget: MAX 8 query reformulations. Use structural, functional AND
    terminological variants.
 7. Never fabricate PMIDs, NCT ids, patent numbers, DOIs, or URLs.
-8. Return MULTIPLE references where available — do not stop at the first hit.
+8. MULTIPLE REFERENCES REQUIRED: After finding the first qualifying reference,
+   CONTINUE searching for more. Search each routed source independently.
+   Return every reference with confidence_score >= 0.5. Do not stop early.
 
 OUTPUT FORMAT
 =============
+CRITICAL: The "evidence" array MUST contain ALL qualifying references you found.
+Do NOT stop after one. Search exhaustively across all routed sources and return
+EVERY reference that has a passage reading on this limitation.
+Minimum target: 3 references per limitation (if they exist in the literature).
+Maximum: no limit — include all qualifying references found.
+
 Return ONLY a single valid JSON object — no markdown fences, no prose.
 
-{{{{
+{{
   "patent_number": "{patent_number}",
   "priority_date": "{priority_date}",
   "claim_number": {claim_number},
   "limitation_id": "{limitation_id}",
   "limitation_text_verbatim": "{limitation_text_escaped}",
   "evidence": [
-    {{{{
-      "reference_id": "Author_PatentNo_Year",
+    {{
+      "reference_id": "Smith_US6123456_1999",
       "source": "Google Patents",
-      "publication_date": "YYYY-MM-DD",
+      "publication_date": "1999-03-15",
       "pre_priority": true,
       "grace_flag": false,
       "locus": "Col. 4, lines 22-35",
-      "passage_verbatim": "exact text from source...",
+      "passage_verbatim": "An injectable aqueous solution comprising axitinib at a concentration of 1-10 mg/mL...",
       "citation_url": "https://patents.google.com/patent/US6123456",
-      "reads_on_rationale": "Discloses the identical feature because...",
+      "reads_on_rationale": "Discloses identical compound in aqueous formulation at overlapping concentration range",
       "confidence_score": 0.92,
-      "confidence_rationale": "Exact compound structure match with identical parameters"
-    }}}}
+      "confidence_rationale": "Exact compound structure match with identical formulation parameters"
+    }},
+    {{
+      "reference_id": "Jones_PMID12345678_2001",
+      "source": "PubMed",
+      "publication_date": "2001-06-15",
+      "pre_priority": true,
+      "grace_flag": false,
+      "locus": "Results section, paragraph 3",
+      "passage_verbatim": "The compound was formulated as an aqueous solution at pH 6.5...",
+      "citation_url": "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+      "reads_on_rationale": "Describes aqueous formulation of the same drug class with matching pH range",
+      "confidence_score": 0.78,
+      "confidence_rationale": "Same drug class and formulation type but different specific compound"
+    }},
+    {{
+      "reference_id": "Chen_EP0987654_2000",
+      "source": "Google Patents",
+      "publication_date": "2000-11-20",
+      "pre_priority": true,
+      "grace_flag": false,
+      "locus": "Claim 1, lines 1-8",
+      "passage_verbatim": "...",
+      "citation_url": "https://patents.google.com/patent/EP0987654",
+      "reads_on_rationale": "...",
+      "confidence_score": 0.71,
+      "confidence_rationale": "..."
+    }}
   ],
   "limitation_status": "covered",
   "flags": []
-}}}}
+}}
 
 confidence_score: 0.0 to 1.0 where:
   0.9-1.0 = exact feature match, verbatim or near-verbatim disclosure
