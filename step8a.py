@@ -600,30 +600,60 @@ async def process_drug(
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
 
-    results = []
-    for i, skel in enumerate(skeletons, 1):
+    # ── Separate cached vs todo ────────────────────────────────
+    cached:  list[dict] = []
+    todo:    list[dict] = []
+
+    for skel in skeletons:
         pn          = skel["patent_number"]
         safe_patent = re.sub(r"[^a-zA-Z0-9_-]", "_", pn)
         out_path    = output_dir / f"{safe_drug}_{safe_patent}_prior_art.json"
 
-        # Skip if already done
         if not rerun and out_path.exists():
             try:
                 existing = json.loads(out_path.read_text(encoding="utf-8"))
                 n_lim    = len(existing.get("limitation_results", []))
-                print(f"[Step 8a] [{i}/{len(skeletons)}] SKIP {pn} — already done ({n_lim} lim(s))")
-                results.append(existing)
+                print(f"[Step 8a] SKIP {pn} — already done ({n_lim} lim(s))")
+                cached.append(existing)
                 continue
             except Exception:
-                pass  # corrupted — re-run
+                pass
 
-        print(f"[Step 8a] [{i}/{len(skeletons)}] Processing {pn}...")
-        try:
-            result = await process_patent(skel, drug_name, output_dir)
-            results.append(result)
-        except Exception as e:
-            print(f"[Step 8a] [{i}/{len(skeletons)}] FAILED {pn}: {e}")
-            # Continue to next patent — don't lose all progress
+        todo.append(skel)
+
+    print(f"[Step 8a] {len(cached)} cached, {len(todo)} to process "
+          f"(up to {_WORKERS} patents in parallel)")
+
+    # ── Process remaining patents in parallel with semaphore ───
+    # Each patent saves immediately on completion.
+    # Semaphore limits total concurrent patents so we don't
+    # overwhelm Gemini's rate limit. Within each patent,
+    # limitations also run in parallel up to _WORKERS.
+    # The two levels share the same worker count — this means
+    # at most _WORKERS LLM calls are in-flight at any moment.
+    patent_sem = asyncio.Semaphore(_WORKERS)
+    new_results: list[dict] = []
+    lock = asyncio.Lock()   # protect new_results list
+
+    async def _safe_process(skel: dict) -> None:
+        """Process one patent with full error isolation."""
+        pn = skel["patent_number"]
+        async with patent_sem:
+            try:
+                result = await process_patent(skel, drug_name, output_dir)
+                async with lock:
+                    new_results.append(result)
+            except Exception as e:
+                print(f"[Step 8a] FAILED {pn}: {e}")
+                # Patent already saved partially inside process_patent
+                # if it got that far; either way, continue to next patent
+
+    if todo:
+        await asyncio.gather(
+            *[_safe_process(skel) for skel in todo],
+        )
+
+    results = cached + new_results
 
     # Combined JSON
     if results:
