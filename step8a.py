@@ -364,8 +364,12 @@ and add a flag explaining the gap.
 
 
 # ─────────────────────────────────────────────────────────────
-# Core per-limitation processor — one LLM call per limitation
+# Core per-limitation processor — with timeout + retry
 # ─────────────────────────────────────────────────────────────
+
+_TIMEOUT_SECS  = int(os.getenv("LLM_TIMEOUT", "120"))
+_MAX_RETRIES   = int(os.getenv("LLM_RETRIES", "2"))
+
 
 async def _search_one_limitation(
     patent_number:  str,
@@ -376,13 +380,13 @@ async def _search_one_limitation(
     lim:            dict,
     context_block:  str,
 ) -> Optional[dict]:
-    """One LLM call for one limitation. Returns the result dict or None."""
+    """One LLM call per limitation with timeout + retry."""
     lid   = lim.get("limitation_id", "?")
     ltext = lim.get("limitation_text_verbatim", "")
     ltype = lim.get("limitation_type", "unknown")
     flags = lim.get("flags", [])
 
-    sources    = ", ".join(_SOURCE_ROUTES.get(ltype, ["Google Patents", "PubMed"]))
+    sources     = ", ".join(_SOURCE_ROUTES.get(ltype, ["Google Patents", "PubMed"]))
     flags_block = f"Flags: {', '.join(flags)}" if flags else ""
     ltext_escaped = ltext.replace('"', '\\"')
 
@@ -401,45 +405,56 @@ async def _search_one_limitation(
         context_block        = context_block,
     )
 
-    try:
-        raw = await generate(
-            prompt         = prompt,
-            use_web_search = True,
-            temperature    = 0.0,
-            max_output_tokens = 65536,
-        )
+    last_error = None
+    for attempt in range(1, _MAX_RETRIES + 2):
+        try:
+            raw = await asyncio.wait_for(
+                generate(
+                    prompt            = prompt,
+                    use_web_search    = True,
+                    temperature       = 0.0,
+                    max_output_tokens = 65536,
+                ),
+                timeout=_TIMEOUT_SECS,
+            )
+            if not raw:
+                print(f"[Step 8a]   {lid}: empty response (attempt {attempt})")
+                last_error = "empty response"
+                continue
 
-        if not raw:
-            print(f"[Step 8a]   {lid}: empty response")
-            return None
+            result = parse_json_response(raw)
+            if result is None:
+                print(f"[Step 8a]   {lid}: JSON parse failed (attempt {attempt})")
+                last_error = "JSON parse failed"
+                continue
 
-        result = parse_json_response(raw)
-        if result is None:
-            print(f"[Step 8a]   {lid}: JSON parse failed — marked uncovered")
-            return {
-                "patent_number":            patent_number,
-                "priority_date":            priority_date,
-                "claim_number":             claim_number,
-                "limitation_id":            lid,
-                "limitation_text_verbatim": ltext,
-                "evidence":                 [],
-                "limitation_status":        "uncovered",
-                "flags":                    ["PARSE_ERROR - LLM response truncated"],
-            }
+            if isinstance(result, list):
+                result = result[0] if result else None
+            if result:
+                status = result.get("limitation_status", "?")
+                n_ev   = len(result.get("evidence", []))
+                print(f"[Step 8a]   {lid}: {status} ({n_ev} evidence) | model: {get_model_name()}")
+            return result
 
-        if isinstance(result, list):
-            result = result[0] if result else None
+        except asyncio.TimeoutError:
+            print(f"[Step 8a]   {lid}: TIMEOUT after {_TIMEOUT_SECS}s (attempt {attempt})")
+            last_error = f"timeout after {_TIMEOUT_SECS}s"
+            continue
+        except Exception as e:
+            print(f"[Step 8a]   {lid}: error - {e} (attempt {attempt})")
+            last_error = str(e)
+            if attempt <= _MAX_RETRIES:
+                await asyncio.sleep(2 * attempt)
+            continue
 
-        if result:
-            status = result.get("limitation_status", "?")
-            n_ev   = len(result.get("evidence", []))
-            print(f"[Step 8a]   {lid}: {status} ({n_ev} evidence) | model: {get_model_name()}")
-
-        return result
-
-    except Exception as e:
-        print(f"[Step 8a]   {lid}: LLM error — {e}")
-        return None
+    print(f"[Step 8a]   {lid}: FAILED after {_MAX_RETRIES + 1} attempts")
+    return {
+        "patent_number": patent_number, "priority_date": priority_date,
+        "claim_number": claim_number, "limitation_id": lid,
+        "limitation_text_verbatim": ltext, "evidence": [],
+        "limitation_status": "uncovered",
+        "flags": [f"SEARCH_FAILED - {last_error}; manual search required"],
+    }
 
 
 async def _search_prior_art_for_claim(
@@ -448,11 +463,7 @@ async def _search_prior_art_for_claim(
     patent_text:    Optional[str],
     analysis_cache: Optional[dict],
 ) -> list[dict]:
-    """
-    Run the prior-art search for all limitations of one independent claim.
-    Fires ONE Gemini call per limitation (parallelised up to _WORKERS)
-    to avoid JSON truncation from large multi-limitation responses.
-    """
+    """Search prior art for all limitations of one claim (parallel within claim)."""
     patent_number = skeleton["patent_number"]
     jurisdiction  = skeleton.get("jurisdiction", "")
     drug_name     = skeleton.get("drug_name", "")
@@ -461,41 +472,23 @@ async def _search_prior_art_for_claim(
     limitations   = claim.get("limitations", [])
 
     if not limitations:
-        print(f"[Step 8a] No limitations for claim {claim_number} of {patent_number}")
         return []
 
-    # ── Build shared context block once (reused across all limitation calls)
     context_parts = []
     if patent_text:
         excerpt = patent_text[:80_000] if len(patent_text) > 80_000 else patent_text
-        context_parts.append(
-            "INDEXED PATENT TEXT (from ChromaDB — for context)\n"
-            "===================================================\n"
-            f"{excerpt}\n"
-        )
+        context_parts.append(f"INDEXED PATENT TEXT (from ChromaDB)\n{'='*50}\n{excerpt}\n")
     if analysis_cache:
-        cache_summary = {
-            k: analysis_cache.get(k)
-            for k in [
-                "claim_category", "tag", "blocking_category", "reason",
-                "step2_elements_present", "step3_evidence_summary",
-                "step5_reason",
-            ]
-            if analysis_cache.get(k)
-        }
+        cache_summary = {k: analysis_cache.get(k) for k in [
+            "claim_category", "tag", "blocking_category", "reason",
+            "step2_elements_present", "step3_evidence_summary", "step5_reason",
+        ] if analysis_cache.get(k)}
         if cache_summary:
-            context_parts.append(
-                "BLOCKING ANALYSIS CACHE\n"
-                "=======================\n"
-                f"{json.dumps(cache_summary, indent=2)}\n"
-            )
-    context_block = "\n".join(context_parts) if context_parts else "(No cached context)\n"
+            context_parts.append(f"BLOCKING ANALYSIS CACHE\n{'='*50}\n{json.dumps(cache_summary, indent=2)}\n")
+    context_block = "\n".join(context_parts) or "(No cached context)\n"
 
-    print(f"[Step 8a] Claim {claim_number} of {patent_number}: "
-          f"searching {len(limitations)} limitation(s) individually "
-          f"(up to {_WORKERS} in parallel)...")
+    print(f"[Step 8a] Claim {claim_number}: {len(limitations)} limitation(s) (up to {_WORKERS} parallel)")
 
-    # ── One call per limitation, parallelised ─────────────────
     sem = asyncio.Semaphore(_WORKERS)
 
     async def _bounded_lim(lim):
@@ -506,8 +499,7 @@ async def _search_prior_art_for_claim(
             )
 
     raw_results = await asyncio.gather(
-        *[_bounded_lim(lim) for lim in limitations],
-        return_exceptions=True,
+        *[_bounded_lim(lim) for lim in limitations], return_exceptions=True,
     )
 
     results = []
@@ -515,44 +507,38 @@ async def _search_prior_art_for_claim(
         lid = lim.get("limitation_id", "?")
         if isinstance(res, Exception):
             print(f"[Step 8a]   {lid}: raised {res}")
+            results.append({"patent_number": patent_number, "priority_date": priority_date,
+                "claim_number": claim_number, "limitation_id": lid,
+                "limitation_text_verbatim": lim.get("limitation_text_verbatim", ""),
+                "evidence": [], "limitation_status": "uncovered",
+                "flags": [f"EXCEPTION - {res}"]})
         elif res is not None:
             results.append(res)
         else:
-            # Gemini returned nothing — mark uncovered
-            results.append({
-                "patent_number":           patent_number,
-                "priority_date":           priority_date,
-                "claim_number":            claim_number,
-                "limitation_id":           lid,
+            results.append({"patent_number": patent_number, "priority_date": priority_date,
+                "claim_number": claim_number, "limitation_id": lid,
                 "limitation_text_verbatim": lim.get("limitation_text_verbatim", ""),
-                "evidence":                [],
-                "limitation_status":       "uncovered",
-                "flags":                   ["NO_RESPONSE - Gemini returned empty; manual search required"],
-            })
+                "evidence": [], "limitation_status": "uncovered",
+                "flags": ["NO_RESPONSE"]})
 
     covered = sum(1 for r in results if r.get("limitation_status") == "covered")
-    print(f"[Step 8a] ✓ Claim {claim_number}: {covered}/{len(results)} limitations covered")
+    print(f"[Step 8a] * Claim {claim_number}: {covered}/{len(results)} covered")
     return results
 
 
 # ─────────────────────────────────────────────────────────────
-# Per-patent orchestrator
+# Per-patent orchestrator — saves immediately after completing
 # ─────────────────────────────────────────────────────────────
 
-async def process_patent(skeleton: dict) -> dict:
-    """
-    Process all independent claims for one patent skeleton.
-    Returns the full step8a output for this patent.
-    """
+async def process_patent(skeleton: dict, drug_name: str, output_dir: Path) -> dict:
+    """Process all claims for one patent. Saves to disk immediately."""
     patent_number = skeleton["patent_number"]
-    drug_name     = skeleton.get("drug_name", "")
     source_file   = skeleton.get("source_file", "")
 
-    print(f"\n[Step 8a] {'═'*50}")
+    print(f"\n[Step 8a] {'='*50}")
     print(f"[Step 8a] Patent: {patent_number} | Drug: {drug_name}")
-    print(f"[Step 8a] {'═'*50}")
+    print(f"[Step 8a] {'='*50}")
 
-    # ── Load ChromaDB text ────────────────────────────────────
     patent_text = None
     if source_file:
         patent_text = _get_chunks_from_chroma(drug_name, source_file)
@@ -561,50 +547,96 @@ async def process_patent(skeleton: dict) -> dict:
         if matched:
             patent_text = _get_chunks_from_chroma(drug_name, matched)
     if patent_text:
-        print(f"[Step 8a] ✓ ChromaDB text: {len(patent_text):,} chars")
-    else:
-        print(f"[Step 8a] ⚠ No ChromaDB text available")
+        print(f"[Step 8a] ChromaDB: {len(patent_text):,} chars")
 
-    # ── Load analysis cache ───────────────────────────────────
     analysis_cache = _load_analysis_cache(drug_name, patent_number)
     if analysis_cache:
-        print(f"[Step 8a] ✓ Analysis cache loaded (tag: {analysis_cache.get('tag', '?')})")
-    else:
-        print(f"[Step 8a] ⚠ No analysis cache")
+        print(f"[Step 8a] Analysis cache: loaded")
 
-    # ── Process each independent claim in parallel ────────────
     claims = skeleton.get("independent_claims", [])
-    all_limitation_results: list[dict] = []
+    all_limitation_results = []
 
-    if claims:
-        sem = asyncio.Semaphore(_WORKERS)
-
-        async def _bounded_claim(claim):
-            async with sem:
-                return await _search_prior_art_for_claim(
-                    skeleton, claim, patent_text, analysis_cache
-                )
-
-        claim_results = await asyncio.gather(
-            *[_bounded_claim(claim) for claim in claims],
-            return_exceptions=True,
+    for claim in claims:
+        lim_results = await _search_prior_art_for_claim(
+            skeleton, claim, patent_text, analysis_cache
         )
-        for claim, res in zip(claims, claim_results):
-            if isinstance(res, Exception):
-                print(f"[Step 8a] ⚠  Claim {claim.get('claim_number')} raised: {res}")
-            else:
-                all_limitation_results.extend(res)
+        all_limitation_results.extend(lim_results)
 
     output = {
         "patent_number": patent_number,
-        "drug_name":     drug_name,
+        "drug_name": drug_name,
         "priority_date": skeleton.get("priority_date", "Unknown"),
-        "jurisdiction":  skeleton.get("jurisdiction", ""),
-        "source_file":   source_file,
+        "jurisdiction": skeleton.get("jurisdiction", ""),
+        "source_file": source_file,
         "limitation_results": all_limitation_results,
     }
 
+    # Save immediately after this patent
+    _write_output(drug_name, output, output_dir)
+    covered = sum(1 for lr in all_limitation_results if lr.get("limitation_status") == "covered")
+    print(f"[Step 8a] SAVED {patent_number}: {covered}/{len(all_limitation_results)} covered\n")
+
     return output
+
+
+# ─────────────────────────────────────────────────────────────
+# Main runner — SEQUENTIAL per patent, with skip logic
+# ─────────────────────────────────────────────────────────────
+
+async def process_drug(
+    drug_name:     str,
+    patent_filter: Optional[str] = None,
+    rerun_step7:   bool          = False,
+    rerun:         bool          = False,
+    output_dir:    Path          = STEP8A_OUTPUT_DIR,
+) -> list[dict]:
+    await _ensure_step7(drug_name, force=rerun_step7)
+
+    skeletons = _load_step7_skeletons(drug_name, patent_filter=patent_filter)
+    if not skeletons:
+        print(f"[Step 8a] No skeletons for '{drug_name}'.")
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_drug = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
+
+    results = []
+    for i, skel in enumerate(skeletons, 1):
+        pn          = skel["patent_number"]
+        safe_patent = re.sub(r"[^a-zA-Z0-9_-]", "_", pn)
+        out_path    = output_dir / f"{safe_drug}_{safe_patent}_prior_art.json"
+
+        # Skip if already done
+        if not rerun and out_path.exists():
+            try:
+                existing = json.loads(out_path.read_text(encoding="utf-8"))
+                n_lim    = len(existing.get("limitation_results", []))
+                print(f"[Step 8a] [{i}/{len(skeletons)}] SKIP {pn} — already done ({n_lim} lim(s))")
+                results.append(existing)
+                continue
+            except Exception:
+                pass  # corrupted — re-run
+
+        print(f"[Step 8a] [{i}/{len(skeletons)}] Processing {pn}...")
+        try:
+            result = await process_patent(skel, drug_name, output_dir)
+            results.append(result)
+        except Exception as e:
+            print(f"[Step 8a] [{i}/{len(skeletons)}] FAILED {pn}: {e}")
+            # Continue to next patent — don't lose all progress
+
+    # Combined JSON
+    if results:
+        combined_path = output_dir / f"{safe_drug}_all_prior_art.json"
+        with open(combined_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n  Combined JSON: {combined_path}")
+
+    covered = sum(1 for r in results for lr in r.get("limitation_results", [])
+                  if lr.get("limitation_status") == "covered")
+    total   = sum(len(r.get("limitation_results", [])) for r in results)
+    print(f"\n[Step 8a] Done. {len(results)} patent(s), {covered}/{total} limitations covered.")
+    return results
 
 
 # ─────────────────────────────────────────────────────────────
@@ -646,65 +678,17 @@ def _write_output(drug_name: str, result: dict, output_dir: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Main async runner
-# ─────────────────────────────────────────────────────────────
-
-async def process_drug(
-    drug_name:     str,
-    patent_filter: Optional[str] = None,
-    rerun_step7:   bool          = False,
-    output_dir:    Path          = STEP8A_OUTPUT_DIR,
-) -> list[dict]:
-    await _ensure_step7(drug_name, force=rerun_step7)
-
-    skeletons = _load_step7_skeletons(drug_name, patent_filter=patent_filter)
-    if not skeletons:
-        print(f"[Step 8a] No skeletons to process for '{drug_name}'.")
-        return []
-
-    print(f"[Step 8a] Processing {len(skeletons)} patent(s) for '{drug_name}' "
-          f"(up to {_WORKERS} workers)...")
-
-    sem = asyncio.Semaphore(_WORKERS)
-
-    async def _bounded(skel):
-        async with sem:
-            return await process_patent(skel)
-
-    raw = await asyncio.gather(
-        *[_bounded(skel) for skel in skeletons],
-        return_exceptions=True,
-    )
-
-    results = []
-    for skel, result in zip(skeletons, raw):
-        if isinstance(result, Exception):
-            print(f"[Step 8a] ⚠  {skel.get('patent_number')} raised: {result}")
-        else:
-            _write_output(drug_name, result, output_dir)
-            results.append(result)
-
-    # Combined summary
-    if results:
-        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
-        combined_path = output_dir / f"{safe}_all_prior_art.json"
-        with open(combined_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
-        print(f"\n  → Combined JSON   : {combined_path}")
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Step 8a – Invalidity Prior-Art Hunter (ChromaDB + cache + Google Search)"
+        description="Step 8a – Prior-Art Hunter (sequential per patent, parallel per limitation)"
     )
     parser.add_argument("--drug",        "-d", required=True)
     parser.add_argument("--patent",      "-p", default=None)
+    parser.add_argument("--rerun",       action="store_true",
+                        help="Re-search all patents even if output exists")
     parser.add_argument("--rerun_step7", action="store_true")
     parser.add_argument("--output_dir",  default=str(STEP8A_OUTPUT_DIR))
     args = parser.parse_args()
@@ -714,24 +698,17 @@ def main() -> None:
 
     print(f"[Step 8a] Drug       : {args.drug}")
     print(f"[Step 8a] Model      : {get_model_name()}")
-    print(f"[Step 8a] ChromaDB   : {CHROMA_DB_PATH}")
-    print(f"[Step 8a] Cache      : {ANALYSIS_CACHE_DIR}")
+    print(f"[Step 8a] Timeout    : {_TIMEOUT_SECS}s | Retries: {_MAX_RETRIES}")
+    print(f"[Step 8a] Workers    : {_WORKERS} (parallel per limitation)")
     print(f"[Step 8a] Output     : {output_dir.resolve()}")
 
     results = asyncio.run(process_drug(
         drug_name     = args.drug,
         patent_filter = args.patent,
         rerun_step7   = args.rerun_step7,
+        rerun         = args.rerun,
         output_dir    = output_dir,
     ))
-
-    covered = sum(
-        1 for r in results
-        for lr in r.get("limitation_results", [])
-        if lr.get("limitation_status") == "covered"
-    )
-    total = sum(len(r.get("limitation_results", [])) for r in results)
-    print(f"\n[Step 8a] Done. {len(results)} patent(s), {covered}/{total} limitations covered.")
 
 
 if __name__ == "__main__":
