@@ -33,23 +33,23 @@ except ImportError:
     pass
 
 # ─────────────────────────────────────────────────────────────
-# Model detection
+# Model detection — reads env var dynamically so that setting
+# os.environ["LLM_MODEL"] before calling generate() always works
 # ─────────────────────────────────────────────────────────────
 
 DEFAULT_MODEL = "gemini-2.5-flash-preview-05-20"
-MODEL         = os.getenv("LLM_MODEL", DEFAULT_MODEL).strip()
+
+
+def get_model_name() -> str:
+    return os.getenv("LLM_MODEL", DEFAULT_MODEL).strip()
 
 
 def is_claude() -> bool:
-    return MODEL.lower().startswith("claude")
+    return get_model_name().lower().startswith("claude")
 
 
 def is_gemini() -> bool:
     return not is_claude()
-
-
-def get_model_name() -> str:
-    return MODEL
 
 
 # ─────────────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ async def _generate_gemini(
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
     response = await client.aio.models.generate_content(
-        model    = MODEL,
+        model    = get_model_name(),
         contents = full_prompt,
         config   = config,
     )
@@ -224,7 +224,7 @@ async def _generate_claude(
 
     # Build request kwargs
     kwargs = {
-        "model":      MODEL,
+        "model":      get_model_name(),
         "max_tokens":  min(max_output_tokens, 16384),
         "messages":    messages,
         "temperature": temperature,
