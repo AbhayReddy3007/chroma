@@ -450,7 +450,12 @@ def _render_word(drug_name: str, chart_data: dict, output_dir: Path) -> Optional
     doc.add_heading("Gap List", level=2)
     if chart_data.get("gap_list"):
         for gap in chart_data["gap_list"]:
-            flags = f" [{', '.join(gap['flags'])}]" if gap.get("flags") else ""
+            raw_flags = gap.get("flags", [])
+            flag_strs = [
+                f.get("flag", str(f)) if isinstance(f, dict) else str(f)
+                for f in raw_flags
+            ]
+            flags = f" [{', '.join(flag_strs)}]" if flag_strs else ""
             rec   = f" → Recommended: {gap['recommended_source']}" if gap.get("recommended_source") else ""
             doc.add_paragraph(
                 f"Claim {gap['claim_number']}, [{gap['limitation_id']}]: "
