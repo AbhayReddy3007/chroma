@@ -178,80 +178,116 @@ def build_excel(
     wb.remove(wb.active)
 
     # ── Sheet 1: Claim Charts ─────────────────────────────────
+    # One row per limitation. All prior art for that limitation
+    # (across all grounds) is merged into a single "Prior Art" cell.
     ws1 = wb.create_sheet("Claim Charts")
-    _col_widths(ws1, [14, 30, 8, 10, 8, 60, 14, 80, 35, 40, 40, 15, 12, 45])
+    _col_widths(ws1, [14, 30, 8, 14, 110])
     r = _header_row(ws1, [
-        "Patent No.", "Filed By", "Claim", "Ground", "Basis",
-        "Limitation (verbatim)", "Limitation ID",
-        "Prior Art Passage(s)", "Reference(s)", "Locus / Citation",
-        "Citation URL", "Pub Date", "Confidence", "Confidence Rationale",
+        "Patent No.", "Filed By", "Claim",
+        "Limitation ID | Limitation (verbatim)",
+        "Prior Art (all references)",
     ], 1)
 
     for chart_data in all_charts:
         patent = chart_data.get("patent", "")
         fb     = filed_by(patent)
+
+        # Group by claim number, then by limitation_id
+        # Collect all prior art passages per (claim, limitation_id) across all grounds
+        from collections import defaultdict, OrderedDict
+
+        # Structure: claim_number -> limitation_id -> { ltext, [prior_art_blocks] }
+        claim_lim_map: dict = OrderedDict()
+
         for chart in chart_data.get("charts", []):
             cn        = chart["claim_number"]
             ground_id = chart["ground_id"]
             basis     = chart["basis"]
 
-            # Ground header row (span all 14 columns)
-            ws1.merge_cells(start_row=r, start_column=1, end_row=r, end_column=14)
-            c = ws1.cell(row=r, column=1, value=chart.get("basis_line", ""))
-            c.font      = Font(name="Arial", bold=True, size=10)
-            c.alignment = Alignment(wrap_text=True, vertical="center")
-            c.border    = _border()
-            ws1.row_dimensions[r].height = 20
-            r += 1
+            if cn not in claim_lim_map:
+                claim_lim_map[cn] = OrderedDict()
 
             for row_data in chart.get("rows", []):
                 lid   = row_data.get("limitation_id", "")
                 ltext = row_data.get("limitation_text", "")
 
-                passages_parts, ref_parts, locus_parts = [], [], []
-                url_parts, date_parts, conf_parts, conf_rat_parts = [], [], [], []
+                if lid not in claim_lim_map[cn]:
+                    claim_lim_map[cn][lid] = {
+                        "ltext":          ltext,
+                        "prior_art_parts": [],
+                    }
+
+                # Collect all evidence passages for this limitation in this ground
                 for cd in row_data.get("cells", []):
                     ref_id = cd.get("reference_id", "")
+                    if ref_id == "—":
+                        continue
                     for p in cd.get("passages", []):
                         passage = p.get("passage_verbatim", "")
-                        locus   = p.get("locus", "")
-                        if passage and "Not disclosed" not in passage:
-                            label = f"[{ref_id}] " if len(row_data["cells"]) > 1 else ""
-                            passages_parts.append(f'{label}"{passage}"')
-                            ref_parts.append(ref_id)
-                            locus_parts.append(f"{ref_id} at {locus}" if locus else ref_id)
-                            url_parts.append(p.get("citation_url", ""))
-                            date_parts.append(p.get("publication_date", ""))
-                            cs = p.get("confidence_score", "")
-                            conf_parts.append(str(cs) if cs != "" else "")
-                            conf_rat_parts.append(p.get("confidence_rationale", ""))
+                        if not passage or "Not disclosed" in passage:
+                            continue
+                        locus    = p.get("locus", "")
+                        url      = p.get("citation_url", "")
+                        pub_date = p.get("publication_date", "")
+                        score    = p.get("confidence_score", "")
+                        rationale = p.get("reads_on_rationale", "")
+                        sub_feat  = p.get("sub_feature", "")
 
-                passage_text = "\n\n".join(passages_parts) or "Not disclosed — see Gap List"
-                ref_text     = "; ".join(dict.fromkeys(ref_parts)) or "—"
-                locus_text   = "\n".join(locus_parts) or "—"
-                url_text     = "\n".join(u for u in url_parts if u) or "—"
-                date_text    = "\n".join(d for d in date_parts if d) or "—"
-                conf_text    = "\n".join(c for c in conf_parts if c) or "—"
-                conf_rat_text = "\n".join(c for c in conf_rat_parts if c) or "—"
+                        lines = []
+                        header = f"[{ref_id}]"
+                        if pub_date:
+                            header += f"  ({pub_date})"
+                        if score != "":
+                            header += f"  Score: {score}"
+                        lines.append(header)
+                        lines.append(f'"{passage}"')
+                        if locus:
+                            lines.append(f"Locus: {locus}")
+                        if url:
+                            lines.append(f"URL: {url}")
+                        if rationale:
+                            lines.append(f"Reads on: {rationale}")
+                        if sub_feat and sub_feat != "full":
+                            lines.append(f"Sub-feature: {sub_feat}")
 
-                _cell(ws1, r, 1,  patent)
-                _cell(ws1, r, 2,  fb)
-                _cell(ws1, r, 3,  cn)
-                _cell(ws1, r, 4,  ground_id)
-                _cell(ws1, r, 5,  f"§{basis}")
-                _cell(ws1, r, 6,  ltext)
-                _cell(ws1, r, 7,  lid)
-                _cell(ws1, r, 8,  passage_text)
-                _cell(ws1, r, 9,  ref_text)
-                _cell(ws1, r, 10, locus_text)
-                _cell(ws1, r, 11, url_text)
-                _cell(ws1, r, 12, date_text)
-                _cell(ws1, r, 13, conf_text)
-                _cell(ws1, r, 14, conf_rat_text)
-                ws1.row_dimensions[r].height = max(40, min(120, 15 * (passage_text.count("\n") + 2)))
+                        block = "\n".join(lines)
+                        # Deduplicate — same ref may appear in multiple grounds
+                        if block not in claim_lim_map[cn][lid]["prior_art_parts"]:
+                            claim_lim_map[cn][lid]["prior_art_parts"].append(block)
+
+        # Now write one row per limitation (one row per unique claim+lim)
+        for cn, lims in claim_lim_map.items():
+            # Claim header row
+            ws1.merge_cells(start_row=r, start_column=1, end_row=r, end_column=5)
+            c = ws1.cell(row=r, column=1,
+                         value=f"Patent: {patent}  |  Claim {cn}  |  Filed By: {fb}")
+            c.font      = Font(name="Arial", bold=True, size=10)
+            c.alignment = Alignment(wrap_text=True, vertical="center")
+            c.border    = _border()
+            ws1.row_dimensions[r].height = 18
+            r += 1
+
+            for lid, data in lims.items():
+                ltext = data["ltext"]
+                parts = data["prior_art_parts"]
+
+                prior_art_text = (
+                    ("\n\n" + "─" * 50 + "\n\n").join(parts)
+                    if parts else "Not disclosed — see Gap List"
+                )
+                lim_cell_text = f"[{lid}]\n{ltext}"
+
+                _cell(ws1, r, 1, patent)
+                _cell(ws1, r, 2, fb)
+                _cell(ws1, r, 3, cn)
+                _cell(ws1, r, 4, lim_cell_text, bold=False)
+                _cell(ws1, r, 5, prior_art_text)
+
+                n_lines = prior_art_text.count("\n") + 2
+                ws1.row_dimensions[r].height = max(40, min(400, 14 * n_lines))
                 r += 1
 
-            r += 1  # blank row between grounds
+            r += 1  # blank row between claims/patents
 
     ws1.freeze_panes = "A2"
 
@@ -323,7 +359,9 @@ def build_excel(
             _cell(ws4, r, 3, gap.get("claim_number", ""))
             _cell(ws4, r, 4, gap.get("limitation_id", ""), bold=True)
             _cell(ws4, r, 5, gap.get("limitation_text", ""))
-            _cell(ws4, r, 6, "; ".join(gap.get("flags", [])) or "—")
+            raw_flags = gap.get("flags", [])
+            flag_strs = [f.get("flag", str(f)) if isinstance(f, dict) else str(f) for f in raw_flags]
+            _cell(ws4, r, 6, "; ".join(flag_strs) or "—")
             _cell(ws4, r, 7, gap.get("recommended_source", "—"))
             _cell(ws4, r, 8, gap.get("recommendation", "—"))
             ws4.row_dimensions[r].height = 35
@@ -361,6 +399,99 @@ def build_excel(
         ws5.cell(row=2, column=1, value="No grace-period-only limitations.")
 
     ws5.freeze_panes = "A2"
+
+    # ── Sheet 6: Source Summary ───────────────────────────────
+    # Counts how many prior art references came from each source
+    ws6 = wb.create_sheet("Source Summary")
+    _col_widths(ws6, [14, 30, 30, 12])
+
+    r = _header_row(ws6, ["Patent No.", "Filed By", "Source", "Count"], 1)
+
+    # Collect source counts per patent + overall
+    from collections import Counter
+    overall_counts = Counter()
+
+    for chart_data in all_charts:
+        patent = chart_data.get("patent", "")
+        fb     = filed_by(patent)
+
+        # Count sources from all evidence across all charts for this patent
+        patent_counts = Counter()
+        for chart in chart_data.get("charts", []):
+            for row_data in chart.get("rows", []):
+                for cd in row_data.get("cells", []):
+                    ref_id = cd.get("reference_id", "")
+                    if ref_id == "—":
+                        continue
+                    for p in cd.get("passages", []):
+                        if p.get("passage_verbatim") and "Not disclosed" not in p.get("passage_verbatim", ""):
+                            # Infer source from citation_url
+                            url = p.get("citation_url", "")
+                            if "patents.google" in url or "patent" in ref_id.lower():
+                                patent_counts["Google Patents"] += 1
+                            elif "pubmed" in url or "PMID" in ref_id:
+                                patent_counts["PubMed"] += 1
+                            elif "clinicaltrials" in url or "NCT" in ref_id:
+                                patent_counts["ClinicalTrials.gov"] += 1
+                            elif "medrxiv" in url or "biorxiv" in url:
+                                patent_counts["medRxiv / bioRxiv"] += 1
+                            else:
+                                patent_counts["Other"] += 1
+
+        # Also count from reference_list (more reliable — has explicit source field)
+        ref_source_counts = Counter()
+        for ref in chart_data.get("reference_list", []):
+            source = ref.get("full_citation", "")
+            if "Google Patents" in source:
+                ref_source_counts["Google Patents"] += 1
+            elif "PubMed" in source:
+                ref_source_counts["PubMed"] += 1
+            elif "ClinicalTrials" in source:
+                ref_source_counts["ClinicalTrials.gov"] += 1
+            elif "medRxiv" in source or "bioRxiv" in source:
+                ref_source_counts["medRxiv / bioRxiv"] += 1
+            else:
+                ref_source_counts["Other"] += 1
+
+        # Use reference_list counts if available, else passage-inferred counts
+        counts = ref_source_counts if ref_source_counts else patent_counts
+
+        for source_name in sorted(counts.keys()):
+            _cell(ws6, r, 1, patent)
+            _cell(ws6, r, 2, fb)
+            _cell(ws6, r, 3, source_name, bold=True)
+            _cell(ws6, r, 4, counts[source_name])
+            ws6.row_dimensions[r].height = 22
+            r += 1
+
+        overall_counts += counts
+
+    # Overall total row
+    if overall_counts:
+        r += 1  # blank row
+        _cell(ws6, r, 1, "", bold=True)
+        _cell(ws6, r, 2, "", bold=True)
+        ws6.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        _cell(ws6, r, 1, "OVERALL TOTAL", bold=True)
+        _cell(ws6, r, 3, "", bold=True)
+        _cell(ws6, r, 4, "", bold=True)
+        r += 1
+
+        for source_name in sorted(overall_counts.keys()):
+            _cell(ws6, r, 1, "")
+            _cell(ws6, r, 2, "")
+            _cell(ws6, r, 3, source_name, bold=True)
+            _cell(ws6, r, 4, overall_counts[source_name])
+            ws6.row_dimensions[r].height = 22
+            r += 1
+
+        # Grand total
+        _cell(ws6, r, 1, "")
+        _cell(ws6, r, 2, "")
+        _cell(ws6, r, 3, "Total References", bold=True)
+        _cell(ws6, r, 4, sum(overall_counts.values()), bold=True)
+
+    ws6.freeze_panes = "A2"
 
     wb.save(str(output_path))
     print(f"Saved: {output_path}")
